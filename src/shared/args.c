@@ -4,6 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stdbool.h>
 
 #include "args.h"
 
@@ -76,7 +77,6 @@ usage(const char *progname)
         "   -c <s>           Timeout de conexión a origen en segundos (0 = deshabilitado).\n"
         "   -i <s>           Timeout idle en segundos (0 = deshabilitado).\n"
         "   -o <file>        Archivo de access log (default: stderr).\n"
-        "   -N               Deshabilitar dissectors.\n"
         "   -v               Imprime la versión y termina.\n"
         "\n",
         progname, MAX_USERS);
@@ -93,7 +93,6 @@ parse_args(const int argc, char **argv, struct socks5args *args)
 
     args->mng_addr = "127.0.0.1";
     args->mng_port = 8080;
-    args->dissectors_enabled = false;
 
     int c;
     int nusers = 0;
@@ -105,7 +104,7 @@ parse_args(const int argc, char **argv, struct socks5args *args)
             {0, 0, 0, 0}
         };
 
-        c = getopt_long(argc, argv, "hl:L:Np:P:u:a:m:t:c:i:o:v", long_options, &option_index);
+        c = getopt_long(argc, argv, "hl:L:p:P:u:a:m:t:c:i:o:v", long_options, &option_index);
         if (c == -1)
             break;
 
@@ -119,9 +118,6 @@ parse_args(const int argc, char **argv, struct socks5args *args)
             break;
         case 'L':
             args->mng_addr = optarg;
-            break;
-        case 'N':
-            args->dissectors_enabled = false;
             break;
         case 'p':
             args->socks_port = port(optarg);

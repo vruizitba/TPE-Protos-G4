@@ -1,8 +1,6 @@
 #ifndef ARGS_H_kFlmYm1tW9p5npzDr2opQJ9jM8
 #define ARGS_H_kFlmYm1tW9p5npzDr2opQJ9jM8
 
-#include <stdbool.h>
-
 #define MAX_USERS 10
 
 struct users
@@ -27,8 +25,6 @@ struct socks5args
     int idle_timeout;         /* -i <s>, 0 = disabled */
 
     char* access_log;         /* -o <file>, NULL = stderr */
-
-    bool dissectors_enabled;
 
     struct users users[MAX_USERS];
 };
