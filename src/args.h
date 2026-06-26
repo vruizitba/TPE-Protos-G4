@@ -19,7 +19,16 @@ struct socks5args
     char* mng_addr;
     unsigned short mng_port;
 
-    bool disectors_enabled;
+    char* admin_secret;       /* -a <secret> */
+
+    int max_connections;      /* -m <n>, 0 = unlimited */
+    int negotiation_timeout;  /* -t <s>, 0 = disabled */
+    int connect_timeout;      /* -c <s>, 0 = disabled */
+    int idle_timeout;         /* -i <s>, 0 = disabled */
+
+    char* access_log;         /* -o <file>, NULL = stderr */
+
+    bool dissectors_enabled;
 
     struct users users[MAX_USERS];
 };

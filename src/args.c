@@ -1,86 +1,99 @@
-#include <stdio.h>     /* for printf */
-#include <stdlib.h>    /* for exit */
-#include <limits.h>    /* LONG_MIN et al */
-#include <string.h>    /* memset */
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <string.h>
 #include <errno.h>
 #include <getopt.h>
 
 #include "args.h"
 
 static unsigned short
-port(const char* s)
+port(const char *s)
 {
-    char* end = 0;
+    char *end = 0;
     const long sl = strtol(s, &end, 10);
 
     if (end == s || '\0' != *end
         || ((LONG_MIN == sl || LONG_MAX == sl) && ERANGE == errno)
         || sl < 0 || sl > USHRT_MAX)
     {
-        fprintf(stderr, "port should in in the range of 1-65536: %s\n", s);
+        fprintf(stderr, "port should be in the range of 1-65535: %s\n", s);
         exit(1);
-        return 1;
     }
     return (unsigned short)sl;
 }
 
-static void
-user(char* s, struct users* user)
+static int
+nonneg_int(const char *s, const char *flag)
 {
-    char* p = strchr(s, ':');
-    if (p == NULL)
+    char *end = 0;
+    const long sl = strtol(s, &end, 10);
+
+    if (end == s || '\0' != *end || sl < 0 || sl > INT_MAX)
     {
-        fprintf(stderr, "password not found\n");
+        fprintf(stderr, "%s requires a non-negative integer: %s\n", flag, s);
         exit(1);
     }
-    else
+    return (int)sl;
+}
+
+static void
+user(char *s, struct users *u)
+{
+    char *p = strchr(s, ':');
+    if (p == NULL)
     {
-        *p = 0;
-        p++;
-        user->name = s;
-        user->pass = p;
+        fprintf(stderr, "user format must be name:password\n");
+        exit(1);
     }
+    *p = 0;
+    u->name = s;
+    u->pass = p + 1;
 }
 
 static void
 version(void)
 {
-    fprintf(stderr, "socks5v version 0.0\n"
-            "ITBA Protocolos de Comunicación 2025/1 -- Grupo X\n"
-            "AQUI VA LA LICENCIA\n");
+    fprintf(stderr, "socks5d version 0.1\n"
+            "ITBA Protocolos de Comunicación 2026/1 -- Grupo 4\n");
 }
 
 static void
-usage(const char* progname)
+usage(const char *progname)
 {
     fprintf(stderr,
-            "Usage: %s [OPTION]...\n"
-            "\n"
-            "   -h               Imprime la ayuda y termina.\n"
-            "   -l <SOCKS addr>  Dirección donde servirá el proxy SOCKS.\n"
-            "   -L <conf  addr>  Dirección donde servirá el servicio de management.\n"
-            "   -p <SOCKS port>  Puerto entrante conexiones SOCKS.\n"
-            "   -P <conf port>   Puerto entrante conexiones configuracion\n"
-            "   -u <name>:<pass> Usuario y contraseña de usuario que puede usar el proxy. Hasta 10.\n"
-            "   -v               Imprime información sobre la versión versión y termina.\n"
-
-            "\n",
-            progname);
+        "Usage: %s [OPTION]...\n"
+        "\n"
+        "   -h               Imprime la ayuda y termina.\n"
+        "   -l <SOCKS addr>  Dirección donde servirá el proxy SOCKS. Default: 0.0.0.0\n"
+        "   -p <SOCKS port>  Puerto SOCKS. Default: 1080\n"
+        "   -L <mgmt addr>   Dirección del servicio de management. Default: 127.0.0.1\n"
+        "   -P <mgmt port>   Puerto de management. Default: 8080\n"
+        "   -u <name>:<pass> Usuario SOCKS (repetible, hasta %d).\n"
+        "   -a <secret>      Credencial de acceso al management.\n"
+        "   -m <n>           Máximo de conexiones concurrentes (0 = sin límite).\n"
+        "   -t <s>           Timeout de negociación en segundos (0 = deshabilitado).\n"
+        "   -c <s>           Timeout de conexión a origen en segundos (0 = deshabilitado).\n"
+        "   -i <s>           Timeout idle en segundos (0 = deshabilitado).\n"
+        "   -o <file>        Archivo de access log (default: stderr).\n"
+        "   -N               Deshabilitar dissectors.\n"
+        "   -v               Imprime la versión y termina.\n"
+        "\n",
+        progname, MAX_USERS);
     exit(1);
 }
 
 void
-parse_args(const int argc, char** argv, struct socks5args* args)
+parse_args(const int argc, char **argv, struct socks5args *args)
 {
-    memset(args, 0, sizeof(*args)); // sobre todo para setear en null los punteros de users
+    memset(args, 0, sizeof(*args));
 
     args->socks_addr = "0.0.0.0";
     args->socks_port = 1080;
 
     args->mng_addr = "127.0.0.1";
     args->mng_port = 8080;
-
-    args->disectors_enabled = true;
+    args->dissectors_enabled = true;
 
     int c;
     int nusers = 0;
@@ -92,7 +105,7 @@ parse_args(const int argc, char** argv, struct socks5args* args)
             {0, 0, 0, 0}
         };
 
-        c = getopt_long(argc, argv, "hl:L:Np:P:u:v", long_options, &option_index);
+        c = getopt_long(argc, argv, "hl:L:Np:P:u:a:m:t:c:i:o:v", long_options, &option_index);
         if (c == -1)
             break;
 
@@ -108,7 +121,7 @@ parse_args(const int argc, char** argv, struct socks5args* args)
             args->mng_addr = optarg;
             break;
         case 'N':
-            args->disectors_enabled = false;
+            args->dissectors_enabled = false;
             break;
         case 'p':
             args->socks_port = port(optarg);
@@ -119,23 +132,38 @@ parse_args(const int argc, char** argv, struct socks5args* args)
         case 'u':
             if (nusers >= MAX_USERS)
             {
-                fprintf(stderr, "maximun number of command line users reached: %d.\n", MAX_USERS);
+                fprintf(stderr, "maximum number of users reached: %d\n", MAX_USERS);
                 exit(1);
             }
-            else
-            {
-                user(optarg, args->users + nusers);
-                nusers++;
-            }
+            user(optarg, args->users + nusers++);
+            break;
+        case 'a':
+            args->admin_secret = optarg;
+            break;
+        case 'm':
+            args->max_connections = nonneg_int(optarg, "-m");
+            break;
+        case 't':
+            args->negotiation_timeout = nonneg_int(optarg, "-t");
+            break;
+        case 'c':
+            args->connect_timeout = nonneg_int(optarg, "-c");
+            break;
+        case 'i':
+            args->idle_timeout = nonneg_int(optarg, "-i");
+            break;
+        case 'o':
+            args->access_log = optarg;
             break;
         case 'v':
             version();
             exit(0);
         default:
-            fprintf(stderr, "unknown argument %d.\n", c);
+            fprintf(stderr, "unknown argument %d\n", c);
             exit(1);
         }
     }
+
     if (optind < argc)
     {
         fprintf(stderr, "argument not accepted: ");
