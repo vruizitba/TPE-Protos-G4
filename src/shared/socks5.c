@@ -1,6 +1,16 @@
 /**
- * socks5nio.c  - controla el flujo de un proxy SOCKSv5 (sockets no bloqueantes)
+ * socks5.c - controla el flujo de un proxy SOCKSv5 (sockets no bloqueantes)
+ *
+ * Referencia de la cátedra. El bloque #if 0 contiene el esqueleto original;
+ * los `...' del ejemplo están marcados como TODO.
+ * Las funciones compilables viven debajo del bloque.
  */
+
+/* ============================================================
+ * REFERENCIA — implementar
+ * ============================================================ */
+#if 0
+
 #include<stdio.h>
 #include <stdlib.h>  // malloc
 #include <string.h>  // memset
@@ -51,7 +61,8 @@ enum socks_v5state {
      */
     HELLO_WRITE,
 
-…
+    /* TODO: AUTH_READ, AUTH_WRITE, REQUEST_READ, REQUEST_WRITE,
+             REQUEST_RESOLV, CONNECTING, COPY */
 
     // estados terminales
     DONE,
@@ -70,7 +81,7 @@ struct hello_st {
     uint8_t               method;
 } ;
 
-…
+/* TODO: struct request_st, struct connecting, struct copy */
 
 /*
  * Si bien cada estado tiene su propio struct que le da un alcance
@@ -81,7 +92,9 @@ struct hello_st {
  * liberarlo finalmente, y un pool para reusar alocaciones previas.
  */
 struct socks5 {
-…
+    /* TODO: client_fd, origin_fd, client_addr, origin_resolution,
+             read_buffer, write_buffer, references, next, pool */
+
     /** maquinas de estados */
     struct state_machine          stm;
 
@@ -96,7 +109,8 @@ struct socks5 {
         struct connecting         conn;
         struct copy               copy;
     } orig;
-…
+
+    /* TODO: resto de campos (user, dest, metrics, access_log, etc.) */
 };
 
 
@@ -278,7 +292,8 @@ static const struct state_definition client_statbl[] = {
         .on_departure     = hello_read_close,
         .on_read_ready    = hello_read,
     },
-…
+    /* TODO: resto de estados */
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Handlers top level de la conexión pasiva.
@@ -335,4 +350,23 @@ socksv5_done(struct selector_key* key) {
             close(fds[i]);
         }
     }
+}
+
+#endif /* referencia cátedra */
+
+/* ============================================================
+ * Implementación — reemplazar este bloque
+ * ============================================================ */
+#include <stddef.h>
+#include "socks5nio.h"
+
+void
+socksv5_pool_destroy(void)
+{
+}
+
+void
+socksv5_passive_accept(struct selector_key *key)
+{
+    (void)key;
 }

@@ -51,6 +51,7 @@ selector_error(const selector_status status) {
 static void
 wake_handler(const int signal) {
     // nada que hacer. está solo para interrumpir el select
+    (void)signal;
 }
 
 // señal a usar para las notificaciones de resolución

@@ -67,8 +67,8 @@ usage(const char *progname)
         "   -h               Imprime la ayuda y termina.\n"
         "   -l <SOCKS addr>  Dirección donde servirá el proxy SOCKS. Default: 0.0.0.0\n"
         "   -p <SOCKS port>  Puerto SOCKS. Default: 1080\n"
-        "   -L <mgmt addr>   Dirección del servicio de management. Default: 127.0.0.1\n"
-        "   -P <mgmt port>   Puerto de management. Default: 8080\n"
+        "   -L <mng addr>    Dirección del servicio de management. Default: 127.0.0.1\n"
+        "   -P <mng port>    Puerto de management. Default: 8080\n"
         "   -u <name>:<pass> Usuario SOCKS (repetible, hasta %d).\n"
         "   -a <secret>      Credencial de acceso al management.\n"
         "   -m <n>           Máximo de conexiones concurrentes (0 = sin límite).\n"
@@ -93,7 +93,7 @@ parse_args(const int argc, char **argv, struct socks5args *args)
 
     args->mng_addr = "127.0.0.1";
     args->mng_port = 8080;
-    args->dissectors_enabled = true;
+    args->dissectors_enabled = false;
 
     int c;
     int nusers = 0;
