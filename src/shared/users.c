@@ -26,8 +26,9 @@ void users_destroy(users_t *u) {
 
 static int find_user(users_t *u, const char *name) {
     for (int i = 0; i < u->count; i++) {
-        if (strncmp(u->entries[i].name, name, NAME_LEN) == 0)
+        if (strncmp(u->entries[i].name, name, NAME_LEN) == 0) {
             return i;
+        }
     }
     return -1;
 }
@@ -39,8 +40,9 @@ bool users_add(users_t *u, const char *name, const char *pass) {
         u->entries[idx].pass[PASS_LEN - 1] = '\0';
         return true;
     }
-    if (u->count >= USERS_MAX)
+    if (u->count >= USERS_MAX) {
         return false;
+    }
     strncpy(u->entries[u->count].name, name, NAME_LEN - 1);
     u->entries[u->count].name[NAME_LEN - 1] = '\0';
     strncpy(u->entries[u->count].pass, pass, PASS_LEN - 1);
@@ -51,8 +53,9 @@ bool users_add(users_t *u, const char *name, const char *pass) {
 
 bool users_del(users_t *u, const char *name) {
     int idx = find_user(u, name);
-    if (idx < 0)
+    if (idx < 0) {
         return false;
+    }
     u->entries[idx] = u->entries[u->count - 1];
     memset(&u->entries[u->count - 1], 0, sizeof(user_entry_t));
     u->count--;
@@ -61,13 +64,15 @@ bool users_del(users_t *u, const char *name) {
 
 bool users_check(users_t *u, const char *name, const char *pass) {
     int idx = find_user(u, name);
-    if (idx < 0)
+    if (idx < 0) {
         return false;
+    }
     return strncmp(u->entries[idx].pass, pass, PASS_LEN) == 0;
 }
 
 const char *users_get_name(users_t *u, int i) {
-    if (i < 0 || i >= u->count)
+    if (i < 0 || i >= u->count) {
         return NULL;
+    }
     return u->entries[i].name;
 }
