@@ -5,6 +5,11 @@
 
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 #include "netutils.h"
 
