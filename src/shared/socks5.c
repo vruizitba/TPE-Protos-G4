@@ -355,18 +355,48 @@ socksv5_done(struct selector_key* key) {
 #endif /* referencia cátedra */
 
 /* ============================================================
- * Implementación — reemplazar este bloque
+ * Implementación
  * ============================================================ */
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 #include "socks5nio.h"
+#include "hello.h"
+#include "buffer.h"
+#include "stm.h"
 
-void
-socksv5_pool_destroy(void)
-{
+#define BUFFER_SIZE 4096
+
+/* TODO: expandir con todos los estados (request, copy, connecting, pool) */
+struct hello_st {
+    buffer *rb, *wb;
+    struct hello_parser parser;
+    uint8_t method;
+};
+
+struct socks5 {
+    int client_fd;
+    int origin_fd;
+
+    buffer read_buffer;
+    buffer write_buffer;
+    uint8_t raw_read[BUFFER_SIZE];
+    uint8_t raw_write[BUFFER_SIZE];
+
+    struct state_machine stm;
+
+    union {
+        struct hello_st hello;
+    } client;
+
+    char authenticated_user[256];
+};
+
+#define ATTACHMENT(key) ((struct socks5 *)(key)->data)
+
+void socksv5_pool_destroy(void) {
 }
 
-void
-socksv5_passive_accept(struct selector_key *key)
-{
+void socksv5_passive_accept(struct selector_key *key) {
     (void)key;
 }

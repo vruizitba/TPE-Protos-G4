@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <inttypes.h>
 #include "access_log.h"
 
 #define TIMESTAMP_LEN 21  /* "2026-06-27T14:32:01Z\0" */
@@ -14,8 +15,8 @@ static void write_timestamp(FILE *f) {
 }
 
 struct access_log {
-    FILE   *file;
-    int     is_stderr;
+    FILE *file;
+    int is_stderr;
 };
 
 access_log_t *access_log_create(const char *path) {
@@ -24,7 +25,7 @@ access_log_t *access_log_create(const char *path) {
         return NULL;
     }
     if (path == NULL) {
-        log->file      = stderr;
+        log->file = stderr;
         log->is_stderr = 1;
     } else {
         log->file = fopen(path, "a");
@@ -56,9 +57,8 @@ void access_log_open(access_log_t *log, const char *user, const char *dest, uint
 void access_log_close(access_log_t *log, const char *user, const char *dest, uint16_t port,
                       uint64_t bytes_c2o, uint64_t bytes_o2c) {
     write_timestamp(log->file);
-    fprintf(log->file, "\t%s\t%s:%u\t%lu\t%lu\tCLOSE\n",
-            user ? user : "-", dest, port,
-            (unsigned long)bytes_c2o, (unsigned long)bytes_o2c);
+    fprintf(log->file, "\t%s\t%s:%u\t%" PRIu64 "\t%" PRIu64 "\tCLOSE\n",
+            user ? user : "-", dest, port, bytes_c2o, bytes_o2c);
     fflush(log->file);
 }
 

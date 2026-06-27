@@ -65,14 +65,14 @@ void metrics_admin_session_close(metrics_t *m) {
 
 metrics_snapshot_t metrics_snapshot(metrics_t *m) {
     metrics_snapshot_t s = {
-        .conn_accepted  = m->conn_accepted,
-        .conn_active    = m->conn_accepted - m->conn_closed,
-        .conn_rejected  = m->conn_rejected,
-        .auth_fail      = m->auth_fail,
-        .origin_ok      = m->origin_ok,
-        .origin_fail    = m->origin_fail,
-        .bytes_c2o      = m->bytes_c2o,
-        .bytes_o2c      = m->bytes_o2c,
+        .conn_accepted = m->conn_accepted,
+        .conn_active = m->conn_accepted - m->conn_closed,
+        .conn_rejected = m->conn_rejected,
+        .auth_fail = m->auth_fail,
+        .origin_ok = m->origin_ok,
+        .origin_fail = m->origin_fail,
+        .bytes_c2o = m->bytes_c2o,
+        .bytes_o2c = m->bytes_o2c,
         .admin_sessions = m->admin_sessions,
     };
     return s;
