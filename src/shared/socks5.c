@@ -360,20 +360,26 @@ socksv5_done(struct selector_key* key) {
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include "socks5nio.h"
+#include "socks5.h"
 #include "hello.h"
 #include "buffer.h"
 #include "stm.h"
 
 #define BUFFER_SIZE 4096
 
-/* TODO: expandir con todos los estados (request, copy, connecting, pool) */
+/* TODO: expand with remaining states (request, copy, connecting, pool) */
 struct hello_st {
     buffer *rb, *wb;
     struct hello_parser parser;
     uint8_t method;
 };
 
+/* DUMMY: provided by the lifecycle module. Only the fields the HELLO states
+   need live here.
+   TODO: replace with the full session struct. */
 struct socks5 {
     int client_fd;
     int origin_fd;
@@ -394,9 +400,134 @@ struct socks5 {
 
 #define ATTACHMENT(key) ((struct socks5 *)(key)->data)
 
+/* DUMMY: the real enum is defined by the lifecycle module */
+enum socks_v5state {
+    HELLO_READ,
+    HELLO_WRITE,
+    AUTH_READ,
+    AUTH_WRITE,
+    /* TODO: REQUEST_READ, REQUEST_WRITE, REQUEST_RESOLV,
+             REQUEST_CONNECTING, COPY */
+    DONE,
+    ERROR,
+};
+
+/* HELLO */
+
+/* Selects the best auth method offered by the client.
+   Prefers USERNAME_PASSWORD over NOAUTH. */
+static void on_hello_method(struct hello_parser *p, uint8_t method) {
+    uint8_t *selected = p->data;
+    if (method == SOCKS_HELLO_USERNAME_PASSWORD) {
+        *selected = method;
+    } else if (method == SOCKS_HELLO_NOAUTHENTICATION_REQUIRED
+               && *selected == SOCKS_HELLO_NO_ACCEPTABLE_METHODS) {
+        *selected = method;
+    }
+}
+
+static void hello_read_init(const unsigned state, struct selector_key *key) {
+    (void)state;
+    struct hello_st *d = &ATTACHMENT(key)->client.hello;
+    d->rb = &ATTACHMENT(key)->read_buffer;
+    d->wb = &ATTACHMENT(key)->write_buffer;
+    d->method = SOCKS_HELLO_NO_ACCEPTABLE_METHODS;
+    d->parser.data = &d->method;
+    d->parser.on_authentication_method = on_hello_method;
+    hello_parser_init(&d->parser);
+}
+
+static unsigned hello_process(struct hello_st *d) {
+    if (hello_marshall(d->wb, d->method) < 0) {
+        return ERROR;
+    }
+    if (d->method == SOCKS_HELLO_NO_ACCEPTABLE_METHODS) {
+        return ERROR;
+    }
+    return HELLO_WRITE;
+}
+
+static unsigned hello_read(struct selector_key *key) {
+    struct hello_st *d = &ATTACHMENT(key)->client.hello;
+    bool error = false;
+    unsigned ret = HELLO_READ;
+
+    size_t count;
+    uint8_t *ptr = buffer_write_ptr(d->rb, &count);
+    ssize_t n = recv(key->fd, ptr, count, 0);
+    if (n <= 0) {
+        return ERROR;
+    }
+    buffer_write_adv(d->rb, n);
+
+    enum hello_state st = hello_consume(d->rb, &d->parser, &error);
+    if (error) {
+        return ERROR;
+    }
+    if (hello_is_done(st, NULL)) {
+        if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        ret = hello_process(d);
+    }
+    return ret;
+}
+
+static unsigned hello_write(struct selector_key *key) {
+    struct hello_st *d = &ATTACHMENT(key)->client.hello;
+
+    size_t count;
+    uint8_t *ptr = buffer_read_ptr(d->wb, &count);
+    ssize_t n = send(key->fd, ptr, count, 0);
+    if (n <= 0) {
+        return ERROR;
+    }
+    buffer_read_adv(d->wb, n);
+
+    if (!buffer_can_read(d->wb)) {
+        if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        return d->method == SOCKS_HELLO_USERNAME_PASSWORD ? AUTH_READ : DONE;
+    }
+    return HELLO_WRITE;
+}
+
+/* State table */
+
+static const struct state_definition client_statbl[] = {
+    {
+        .state = HELLO_READ,
+        .on_arrival = hello_read_init,
+        .on_read_ready = hello_read,
+    },
+    {
+        .state = HELLO_WRITE,
+        .on_write_ready = hello_write,
+    },
+    {
+        .state = AUTH_READ,
+        /* TODO: auth handlers */
+    },
+    {
+        .state = AUTH_WRITE,
+        /* TODO: auth handlers */
+    },
+    {
+        .state = DONE,
+    },
+    {
+        .state = ERROR,
+    },
+};
+
+/* DUMMY: stubs so the binary links. Owned by the lifecycle module.
+   TODO: implement the real lifecycle. */
+
 void socksv5_pool_destroy(void) {
 }
 
 void socksv5_passive_accept(struct selector_key *key) {
     (void)key;
+    (void)client_statbl;
 }
