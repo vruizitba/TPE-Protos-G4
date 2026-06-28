@@ -76,3 +76,7 @@ const char *users_get_name(users_t *u, int i) {
     }
     return u->entries[i].name;
 }
+
+int users_count(users_t *u) {
+    return u->count;
+}

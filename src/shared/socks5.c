@@ -423,12 +423,16 @@ enum socks_v5state {
     ERROR,
 };
 
+/* server context, set by main */
+static users_t *g_users = NULL;
+static metrics_t *g_metrics = NULL;
+
 /* HELLO */
 
 /* Selects the best auth method offered by the client.
    Prefers USERNAME_PASSWORD over NOAUTH. */
-static void on_hello_method(struct hello_parser *p, uint8_t method) {
-    uint8_t *selected = p->data;
+static void on_hello_method(struct hello_parser *parser, uint8_t method) {
+    uint8_t *selected = parser->data;
     if (method == SOCKS_HELLO_USERNAME_PASSWORD) {
         *selected = method;
     } else if (method == SOCKS_HELLO_NOAUTHENTICATION_REQUIRED
@@ -449,6 +453,11 @@ static void hello_read_init(const unsigned state, struct selector_key *key) {
 }
 
 static unsigned hello_process(struct hello_st *hello) {
+    /* if users exist, require user/pass */
+    if (hello->method != SOCKS_HELLO_USERNAME_PASSWORD
+        && g_users != NULL && users_count(g_users) > 0) {
+        hello->method = SOCKS_HELLO_NO_ACCEPTABLE_METHODS;
+    }
     if (hello_marshall(hello->write_buffer, hello->method) < 0) {
         return ERROR;
     }
@@ -505,9 +514,6 @@ static unsigned hello_write(struct selector_key *key) {
 }
 
 /* AUTH */
-
-static users_t *g_users = NULL;
-static metrics_t *g_metrics = NULL;
 
 /* TODO: call socksv5_set_users() from main after loading users from args */
 void socksv5_set_users(users_t *u) {

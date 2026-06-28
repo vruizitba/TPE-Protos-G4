@@ -14,6 +14,9 @@ bool users_add(users_t *u, const char *name, const char *pass);
 bool users_del(users_t *u, const char *name);
 bool users_check(users_t *u, const char *name, const char *pass);
 
+/* Number of users currently stored */
+int users_count(users_t *u);
+
 /* Iterate: returns name of user at index i, NULL if out of bounds */
 const char *users_get_name(users_t *u, int i);
 
