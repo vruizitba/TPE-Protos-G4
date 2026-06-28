@@ -23,9 +23,9 @@ struct hello_parser {
     uint8_t remaining;
 };
 
-void hello_parser_init(struct hello_parser *p);
-enum hello_state hello_consume(buffer *b, struct hello_parser *p, bool *error);
+void hello_parser_init(struct hello_parser *parser);
+enum hello_state hello_consume(buffer *buffer_ptr, struct hello_parser *parser, bool *error);
 bool hello_is_done(enum hello_state state, bool *error);
-int hello_marshall(buffer *b, uint8_t method);
+int hello_marshall(buffer *buffer_ptr, uint8_t method);
 
 #endif

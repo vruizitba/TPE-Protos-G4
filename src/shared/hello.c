@@ -1,50 +1,50 @@
 #include "hello.h"
 #include "socks5.h"
 
-void hello_parser_init(struct hello_parser *p) {
-    p->state = hello_version;
-    p->remaining = 0;
+void hello_parser_init(struct hello_parser *parser) {
+    parser->state = hello_version;
+    parser->remaining = 0;
 }
 
-enum hello_state hello_consume(buffer *b, struct hello_parser *p, bool *error) {
-    while (buffer_can_read(b)) {
-        uint8_t byte = buffer_read(b);
-        switch (p->state) {
+enum hello_state hello_consume(buffer *buffer_ptr, struct hello_parser *parser, bool *error) {
+    while (buffer_can_read(buffer_ptr)) {
+        uint8_t byte = buffer_read(buffer_ptr);
+        switch (parser->state) {
             case hello_version:
                 if (byte != SOCKS_VERSION) {
-                    p->state = hello_error;
+                    parser->state = hello_error;
                     *error = true;
                 } else {
-                    p->state = hello_nmethods;
+                    parser->state = hello_nmethods;
                 }
                 break;
             case hello_nmethods:
                 if (byte == 0) {
-                    p->state = hello_error;
+                    parser->state = hello_error;
                     *error = true;
                 } else {
-                    p->remaining = byte;
-                    p->state = hello_methods;
+                    parser->remaining = byte;
+                    parser->state = hello_methods;
                 }
                 break;
             case hello_methods:
-                if (p->on_authentication_method != NULL) {
-                    p->on_authentication_method(p, byte);
+                if (parser->on_authentication_method != NULL) {
+                    parser->on_authentication_method(parser, byte);
                 }
-                p->remaining--;
-                if (p->remaining == 0) {
-                    p->state = hello_done;
+                parser->remaining--;
+                if (parser->remaining == 0) {
+                    parser->state = hello_done;
                 }
                 break;
             case hello_done:
             case hello_error:
                 break;
         }
-        if (p->state == hello_done || p->state == hello_error) {
+        if (parser->state == hello_done || parser->state == hello_error) {
             break;
         }
     }
-    return p->state;
+    return parser->state;
 }
 
 bool hello_is_done(enum hello_state state, bool *error) {
@@ -57,14 +57,14 @@ bool hello_is_done(enum hello_state state, bool *error) {
     return state == hello_done;
 }
 
-int hello_marshall(buffer *b, uint8_t method) {
-    size_t n;
-    uint8_t *ptr = buffer_write_ptr(b, &n);
-    if (n < 2) {
+int hello_marshall(buffer *buffer_ptr, uint8_t method) {
+    size_t available;
+    uint8_t *write_ptr = buffer_write_ptr(buffer_ptr, &available);
+    if (available < 2) {
         return -1;
     }
-    ptr[0] = SOCKS_VERSION;
-    ptr[1] = method;
-    buffer_write_adv(b, 2);
+    write_ptr[0] = SOCKS_VERSION;
+    write_ptr[1] = method;
+    buffer_write_adv(buffer_ptr, 2);
     return 0;
 }

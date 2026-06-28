@@ -367,14 +367,24 @@ socksv5_done(struct selector_key* key) {
 #include "hello.h"
 #include "buffer.h"
 #include "stm.h"
+#include "auth.h"
+#include "users.h"
+#include "metrics.h"
 
 #define BUFFER_SIZE 4096
 
 /* TODO: expand with remaining states (request, copy, connecting, pool) */
 struct hello_st {
-    buffer *rb, *wb;
+    buffer *read_buffer;
+    buffer *write_buffer;
     struct hello_parser parser;
     uint8_t method;
+};
+
+struct auth_st {
+    buffer *read_buffer;
+    buffer *write_buffer;
+    struct auth_parser parser;
 };
 
 /* DUMMY: provided by the lifecycle module. Only the fields the HELLO states
@@ -393,6 +403,7 @@ struct socks5 {
 
     union {
         struct hello_st hello;
+        struct auth_st auth;
     } client;
 
     char authenticated_user[256];
@@ -428,69 +439,157 @@ static void on_hello_method(struct hello_parser *p, uint8_t method) {
 
 static void hello_read_init(const unsigned state, struct selector_key *key) {
     (void)state;
-    struct hello_st *d = &ATTACHMENT(key)->client.hello;
-    d->rb = &ATTACHMENT(key)->read_buffer;
-    d->wb = &ATTACHMENT(key)->write_buffer;
-    d->method = SOCKS_HELLO_NO_ACCEPTABLE_METHODS;
-    d->parser.data = &d->method;
-    d->parser.on_authentication_method = on_hello_method;
-    hello_parser_init(&d->parser);
+    struct hello_st *hello = &ATTACHMENT(key)->client.hello;
+    hello->read_buffer = &ATTACHMENT(key)->read_buffer;
+    hello->write_buffer = &ATTACHMENT(key)->write_buffer;
+    hello->method = SOCKS_HELLO_NO_ACCEPTABLE_METHODS;
+    hello->parser.data = &hello->method;
+    hello->parser.on_authentication_method = on_hello_method;
+    hello_parser_init(&hello->parser);
 }
 
-static unsigned hello_process(struct hello_st *d) {
-    if (hello_marshall(d->wb, d->method) < 0) {
+static unsigned hello_process(struct hello_st *hello) {
+    if (hello_marshall(hello->write_buffer, hello->method) < 0) {
         return ERROR;
     }
-    if (d->method == SOCKS_HELLO_NO_ACCEPTABLE_METHODS) {
+    if (hello->method == SOCKS_HELLO_NO_ACCEPTABLE_METHODS) {
         return ERROR;
     }
     return HELLO_WRITE;
 }
 
 static unsigned hello_read(struct selector_key *key) {
-    struct hello_st *d = &ATTACHMENT(key)->client.hello;
+    struct hello_st *hello = &ATTACHMENT(key)->client.hello;
     bool error = false;
-    unsigned ret = HELLO_READ;
+    unsigned next_state = HELLO_READ;
 
-    size_t count;
-    uint8_t *ptr = buffer_write_ptr(d->rb, &count);
-    ssize_t n = recv(key->fd, ptr, count, 0);
-    if (n <= 0) {
+    size_t available;
+    uint8_t *write_ptr = buffer_write_ptr(hello->read_buffer, &available);
+    ssize_t received = recv(key->fd, write_ptr, available, 0);
+    if (received <= 0) {
         return ERROR;
     }
-    buffer_write_adv(d->rb, n);
+    buffer_write_adv(hello->read_buffer, received);
 
-    enum hello_state st = hello_consume(d->rb, &d->parser, &error);
+    enum hello_state state = hello_consume(hello->read_buffer, &hello->parser, &error);
     if (error) {
         return ERROR;
     }
-    if (hello_is_done(st, NULL)) {
+    if (hello_is_done(state, NULL)) {
         if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
             return ERROR;
         }
-        ret = hello_process(d);
+        next_state = hello_process(hello);
     }
-    return ret;
+    return next_state;
 }
 
 static unsigned hello_write(struct selector_key *key) {
-    struct hello_st *d = &ATTACHMENT(key)->client.hello;
+    struct hello_st *hello = &ATTACHMENT(key)->client.hello;
 
-    size_t count;
-    uint8_t *ptr = buffer_read_ptr(d->wb, &count);
-    ssize_t n = send(key->fd, ptr, count, 0);
-    if (n <= 0) {
+    size_t pending;
+    uint8_t *read_ptr = buffer_read_ptr(hello->write_buffer, &pending);
+    ssize_t sent = send(key->fd, read_ptr, pending, 0);
+    if (sent <= 0) {
         return ERROR;
     }
-    buffer_read_adv(d->wb, n);
+    buffer_read_adv(hello->write_buffer, sent);
 
-    if (!buffer_can_read(d->wb)) {
+    if (!buffer_can_read(hello->write_buffer)) {
         if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
             return ERROR;
         }
-        return d->method == SOCKS_HELLO_USERNAME_PASSWORD ? AUTH_READ : DONE;
+        return hello->method == SOCKS_HELLO_USERNAME_PASSWORD ? AUTH_READ : DONE;
     }
     return HELLO_WRITE;
+}
+
+/* AUTH */
+
+static users_t *g_users = NULL;
+static metrics_t *g_metrics = NULL;
+
+/* TODO: call socksv5_set_users() from main after loading users from args */
+void socksv5_set_users(users_t *u) {
+    g_users = u;
+}
+
+/* TODO: call socksv5_set_metrics() from main after creating metrics */
+void socksv5_set_metrics(metrics_t *m) {
+    g_metrics = m;
+}
+
+static void auth_read_init(const unsigned state, struct selector_key *key) {
+    (void)state;
+    struct auth_st *auth = &ATTACHMENT(key)->client.auth;
+    auth->read_buffer = &ATTACHMENT(key)->read_buffer;
+    auth->write_buffer = &ATTACHMENT(key)->write_buffer;
+    auth_parser_init(&auth->parser);
+}
+
+static unsigned auth_process(struct auth_st *auth, struct socks5 *session) {
+    uint8_t status = 0x01;
+    if (g_users == NULL || users_check(g_users, auth->parser.uname, auth->parser.passwd)) {
+        status = 0x00;
+        strncpy(session->authenticated_user, auth->parser.uname,
+                sizeof(session->authenticated_user) - 1);
+        session->authenticated_user[sizeof(session->authenticated_user) - 1] = '\0';
+    } else {
+        if (g_metrics != NULL) {
+            metrics_auth_fail(g_metrics);
+        }
+    }
+    if (auth_marshall(auth->write_buffer, status) < 0) {
+        return ERROR;
+    }
+    return AUTH_WRITE;
+}
+
+static unsigned auth_read(struct selector_key *key) {
+    struct auth_st *auth = &ATTACHMENT(key)->client.auth;
+    unsigned next_state = AUTH_READ;
+
+    size_t available;
+    uint8_t *write_ptr = buffer_write_ptr(auth->read_buffer, &available);
+    ssize_t received = recv(key->fd, write_ptr, available, 0);
+    if (received <= 0) {
+        return ERROR;
+    }
+    buffer_write_adv(auth->read_buffer, received);
+
+    bool error = false;
+    enum auth_state state = auth_consume(auth->read_buffer, &auth->parser, &error);
+    if (error) {
+        return ERROR;
+    }
+    if (auth_is_done(state, NULL)) {
+        if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        next_state = auth_process(auth, ATTACHMENT(key));
+    }
+    return next_state;
+}
+
+static unsigned auth_write(struct selector_key *key) {
+    struct auth_st *auth = &ATTACHMENT(key)->client.auth;
+
+    size_t pending;
+    uint8_t *read_ptr = buffer_read_ptr(auth->write_buffer, &pending);
+    ssize_t sent = send(key->fd, read_ptr, pending, 0);
+    if (sent <= 0) {
+        return ERROR;
+    }
+    buffer_read_adv(auth->write_buffer, sent);
+
+    if (!buffer_can_read(auth->write_buffer)) {
+        if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        /* TODO: on success go to REQUEST_READ; for now DONE */
+        return DONE;
+    }
+    return AUTH_WRITE;
 }
 
 /* State table */
@@ -507,11 +606,12 @@ static const struct state_definition client_statbl[] = {
     },
     {
         .state = AUTH_READ,
-        /* TODO: auth handlers */
+        .on_arrival = auth_read_init,
+        .on_read_ready = auth_read,
     },
     {
         .state = AUTH_WRITE,
-        /* TODO: auth handlers */
+        .on_write_ready = auth_write,
     },
     {
         .state = DONE,
