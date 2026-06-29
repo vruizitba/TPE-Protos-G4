@@ -44,10 +44,10 @@ request_consume(buffer *b, struct request_parser *p, bool *error)
                 p->request->dest_addr.type = byte;
                 p->read = 0;
                 if (byte == SOCKS_ATYP_IPV4) {
-                    p->remaining = 4;
+                    p->remaining = SOCKS_ATYP_IPV4_LEN;
                     p->state = request_dst_addr;
                 } else if (byte == SOCKS_ATYP_IPV6) {
-                    p->remaining = 16;
+                    p->remaining = SOCKS_ATYP_IPV6_LEN;
                     p->state = request_dst_addr;
                 } else if (byte == SOCKS_ATYP_FQDN) {
                     p->remaining = 0; /* length byte not yet read */

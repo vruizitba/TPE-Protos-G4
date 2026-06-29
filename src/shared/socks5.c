@@ -15,6 +15,7 @@
 #include "auth.h"
 #include "users.h"
 #include "metrics.h"
+#include "dns_worker.h"
 
 #define BUFFER_SIZE 4096
 #define N(x) (sizeof(x) / sizeof((x)[0]))
@@ -116,6 +117,7 @@ static unsigned pool_size;
 static const unsigned max_pool = 50;
 static users_t *g_users = NULL;
 static metrics_t *g_metrics = NULL;
+static dns_worker_t *g_dns_worker = NULL;
 
 static unsigned unimplemented_read(struct selector_key *key) {
     (void)key;
@@ -123,11 +125,6 @@ static unsigned unimplemented_read(struct selector_key *key) {
 }
 
 static unsigned unimplemented_write(struct selector_key *key) {
-    (void)key;
-    return ERROR;
-}
-
-static unsigned unimplemented_block(struct selector_key *key) {
     (void)key;
     return ERROR;
 }
@@ -219,6 +216,10 @@ void socksv5_set_users(users_t *u) {
 
 void socksv5_set_metrics(metrics_t *m) {
     g_metrics = m;
+}
+
+void socksv5_set_dns_worker(dns_worker_t *w) {
+    g_dns_worker = w;
 }
 
 static void auth_read_init(const unsigned state, struct selector_key *key) {
@@ -325,8 +326,41 @@ static unsigned request_process(struct selector_key *key) {
         return ERROR;
     }
     if (req->request.dest_addr.type == SOCKS_ATYP_FQDN) {
+        if (g_dns_worker == NULL ||
+            dns_worker_submit(g_dns_worker, key->fd,
+                              req->request.dest_addr.fqdn,
+                              req->request.dest_port,
+                              &s->origin_resolution,
+                              key->s) != 0) {
+            req->reply = SOCKS_REPLY_GENERAL_FAILURE;
+            if (request_marshall(req->wb, req->reply) < 0) {
+                return ERROR;
+            }
+            if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+                return ERROR;
+            }
+            return REQUEST_WRITE;
+        }
         return REQUEST_RESOLV;
     }
+    return CONNECTING;
+}
+
+static unsigned request_resolv_done(struct selector_key *key) {
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+
+    if (s->origin_resolution == NULL) {
+        req->reply = SOCKS_REPLY_HOST_UNREACHABLE;
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+    s->orig.conn.current = s->origin_resolution;
     return CONNECTING;
 }
 
@@ -402,7 +436,7 @@ static const struct state_definition client_statbl[] = {
     },
     {
         .state = REQUEST_RESOLV,
-        .on_block_ready = unimplemented_block,
+        .on_block_ready = request_resolv_done,
     },
     {
         .state = CONNECTING,
