@@ -1,4 +1,6 @@
+#include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -9,6 +11,7 @@
 #include "hello.h"
 #include "request.h"
 #include "buffer.h"
+#include "netutils.h"
 #include "stm.h"
 #include "socks5nio.h"
 #include "socks5.h"
@@ -111,6 +114,7 @@ static void socksv5_read(struct selector_key *key);
 static void socksv5_write(struct selector_key *key);
 static void socksv5_block(struct selector_key *key);
 static void socksv5_close(struct selector_key *key);
+static const struct fd_handler socks5_handler;
 
 static struct socks5 *pool;
 static unsigned pool_size;
@@ -410,6 +414,165 @@ static unsigned request_write(struct selector_key *key) {
     return REQUEST_WRITE;
 }
 
+/*
+ * Tries to create a non-blocking socket and connect to addr.
+ * Stores the new fd in s->origin_fd on success.
+ * Returns 0 if connect() succeeded or returned EINPROGRESS, -1 otherwise.
+ */
+static int
+connecting_try_one(struct socks5 *s, const struct sockaddr *addr, socklen_t addrlen)
+{
+    int fd = socket(addr->sa_family, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    if (selector_fd_set_nio(fd) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (connect(fd, addr, addrlen) < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    s->origin_fd = fd;
+    return 0;
+}
+
+/*
+ * Iterates s->orig.conn.current (addrinfo list from DNS).
+ * On the first address that accepts a connect(), registers origin_fd with
+ * OP_WRITE and increments s->references.
+ * If all addresses are exhausted, sets client_fd to OP_WRITE so
+ * connecting_write can send the error reply.
+ */
+static void
+connecting_try_addrinfo(struct selector_key *key)
+{
+    struct socks5 *s = ATTACHMENT(key);
+
+    while (s->orig.conn.current != NULL) {
+        struct addrinfo *ai = s->orig.conn.current;
+        s->orig.conn.current = ai->ai_next;
+
+        if (connecting_try_one(s, ai->ai_addr, ai->ai_addrlen) == 0) {
+            s->references++;
+            selector_register(key->s, s->origin_fd, &socks5_handler, OP_WRITE, s);
+            return;
+        }
+        s->orig.conn.reply = errno_to_socks_reply(errno);
+    }
+    selector_set_interest(key->s, s->client_fd, OP_WRITE);
+}
+
+static void
+connecting_init(const unsigned state, struct selector_key *key)
+{
+    (void)state;
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+    s->orig.conn.reply = SOCKS_REPLY_GENERAL_FAILURE;
+
+    if (s->orig.conn.current != NULL) {
+        /* FQDN */
+        connecting_try_addrinfo(key);
+    } else {
+        /* IPv4/IPv6 */
+        struct sockaddr_storage ss;
+        socklen_t sslen;
+        memset(&ss, 0, sizeof(ss));
+
+        if (req->request.dest_addr.type == SOCKS_ATYP_IPV4) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+            sin->sin_family = AF_INET;
+            sin->sin_addr = req->request.dest_addr.ipv4;
+            sin->sin_port = htons(req->request.dest_port);
+            sslen = sizeof(*sin);
+        } else {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_addr = req->request.dest_addr.ipv6;
+            sin6->sin6_port = htons(req->request.dest_port);
+            sslen = sizeof(*sin6);
+        }
+
+        if (connecting_try_one(s, (struct sockaddr *)&ss, sslen) == 0) {
+            s->references++;
+            selector_register(key->s, s->origin_fd, &socks5_handler, OP_WRITE, s);
+        } else {
+            s->orig.conn.reply = errno_to_socks_reply(errno);
+            selector_set_interest(key->s, s->client_fd, OP_WRITE);
+        }
+    }
+}
+
+static unsigned
+connecting_write(struct selector_key *key)
+{
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+
+    if (key->fd == s->client_fd) {
+        /* Connect failed */
+        req->reply = s->orig.conn.reply;
+        if (g_metrics != NULL) {
+            metrics_origin_fail(g_metrics);
+        }
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(key->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+        err = errno;
+    }
+
+    if (err == 0) {
+        /* Connect succeeded */
+        if (g_metrics != NULL) {
+            metrics_origin_ok(g_metrics);
+        }
+        req->reply = SOCKS_REPLY_SUCCEEDED;
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        if (selector_set_interest(key->s, s->client_fd, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        if (selector_set_interest_key(key, OP_NOOP) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+
+    /* Connect failed on this address */
+    s->orig.conn.reply = errno_to_socks_reply(err);
+    selector_unregister_fd(key->s, s->origin_fd);
+    close(s->origin_fd);
+    s->origin_fd = -1;
+
+    if (s->orig.conn.current != NULL) {
+        /* More addresses to try (FQDN with multiple IPs) */
+        connecting_try_addrinfo(key);
+        return CONNECTING;
+    }
+
+    /* No more addresses */
+    if (g_metrics != NULL) {
+        metrics_origin_fail(g_metrics);
+    }
+    req->reply = s->orig.conn.reply;
+    if (request_marshall(req->wb, req->reply) < 0) {
+        return ERROR;
+    }
+    if (selector_set_interest(key->s, s->client_fd, OP_WRITE) != SELECTOR_SUCCESS) {
+        return ERROR;
+    }
+    return REQUEST_WRITE;
+}
+
 static const struct state_definition client_statbl[] = {
     {
         .state = HELLO_READ,
@@ -440,7 +603,8 @@ static const struct state_definition client_statbl[] = {
     },
     {
         .state = CONNECTING,
-        .on_write_ready = unimplemented_write,
+        .on_arrival = connecting_init,
+        .on_write_ready = connecting_write,
     },
     {
         .state = REQUEST_WRITE,
