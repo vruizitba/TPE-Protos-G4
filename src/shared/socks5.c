@@ -113,7 +113,7 @@ static void socksv5_close(struct selector_key *key);
 
 static struct socks5 *pool;
 static unsigned pool_size;
-static const int max_pool = 50;
+static const unsigned max_pool = 50;
 static users_t *g_users = NULL;
 static metrics_t *g_metrics = NULL;
 
