@@ -18,6 +18,7 @@ enum request_state {
     request_done,
     request_error,
     request_error_unsupported_atyp,
+    request_error_unsupported_cmd,
 };
 
 struct request_addr {

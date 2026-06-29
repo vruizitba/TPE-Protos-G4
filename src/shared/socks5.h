@@ -19,6 +19,10 @@
 #define SOCKS_ATYP_FQDN 0x03
 #define SOCKS_ATYP_IPV6 0x04
 
+/* Address lengths in bytes */
+#define SOCKS_ATYP_IPV4_LEN 4
+#define SOCKS_ATYP_IPV6_LEN 16
+
 /* Reply codes */
 #define SOCKS_REPLY_SUCCEEDED 0x00
 #define SOCKS_REPLY_GENERAL_FAILURE 0x01

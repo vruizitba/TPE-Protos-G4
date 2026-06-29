@@ -1,4 +1,6 @@
+#include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -9,12 +11,14 @@
 #include "hello.h"
 #include "request.h"
 #include "buffer.h"
+#include "netutils.h"
 #include "stm.h"
 #include "socks5nio.h"
 #include "socks5.h"
 #include "auth.h"
 #include "users.h"
 #include "metrics.h"
+#include "dns_worker.h"
 
 #define BUFFER_SIZE 4096
 #define N(x) (sizeof(x) / sizeof((x)[0]))
@@ -110,12 +114,14 @@ static void socksv5_read(struct selector_key *key);
 static void socksv5_write(struct selector_key *key);
 static void socksv5_block(struct selector_key *key);
 static void socksv5_close(struct selector_key *key);
+static const struct fd_handler socks5_handler;
 
 static struct socks5 *pool;
 static unsigned pool_size;
-static const int max_pool = 50;
+static const unsigned max_pool = 50;
 static users_t *g_users = NULL;
 static metrics_t *g_metrics = NULL;
+static dns_worker_t *g_dns_worker = NULL;
 
 static unsigned unimplemented_read(struct selector_key *key) {
     (void)key;
@@ -123,11 +129,6 @@ static unsigned unimplemented_read(struct selector_key *key) {
 }
 
 static unsigned unimplemented_write(struct selector_key *key) {
-    (void)key;
-    return ERROR;
-}
-
-static unsigned unimplemented_block(struct selector_key *key) {
     (void)key;
     return ERROR;
 }
@@ -221,6 +222,10 @@ void socksv5_set_metrics(metrics_t *m) {
     g_metrics = m;
 }
 
+void socksv5_set_dns_worker(dns_worker_t *w) {
+    g_dns_worker = w;
+}
+
 static void auth_read_init(const unsigned state, struct selector_key *key) {
     (void)state;
     struct auth_st *auth = &ATTACHMENT(key)->client.auth;
@@ -293,6 +298,281 @@ static unsigned auth_write(struct selector_key *key) {
     return AUTH_WRITE;
 }
 
+static void request_read_init(const unsigned state, struct selector_key *key) {
+    (void)state;
+    struct request_st *req = &ATTACHMENT(key)->client.request;
+    req->rb = &ATTACHMENT(key)->read_buffer;
+    req->wb = &ATTACHMENT(key)->write_buffer;
+    req->reply = SOCKS_REPLY_GENERAL_FAILURE;
+    req->parser.request = &req->request;
+    request_parser_init(&req->parser);
+}
+
+static unsigned request_process(struct selector_key *key) {
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+    enum request_state st = req->parser.state;
+
+    if (st == request_error_unsupported_cmd || st == request_error_unsupported_atyp) {
+        req->reply = (st == request_error_unsupported_cmd)
+            ? SOCKS_REPLY_CMD_NOT_SUPPORTED
+            : SOCKS_REPLY_ATYP_NOT_SUPPORTED;
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+    /* request_done: proceed to DNS resolution or direct connect */
+    if (selector_set_interest_key(key, OP_NOOP) != SELECTOR_SUCCESS) {
+        return ERROR;
+    }
+    if (req->request.dest_addr.type == SOCKS_ATYP_FQDN) {
+        if (g_dns_worker == NULL ||
+            dns_worker_submit(g_dns_worker, key->fd,
+                              req->request.dest_addr.fqdn,
+                              req->request.dest_port,
+                              &s->origin_resolution,
+                              key->s) != 0) {
+            req->reply = SOCKS_REPLY_GENERAL_FAILURE;
+            if (request_marshall(req->wb, req->reply) < 0) {
+                return ERROR;
+            }
+            if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+                return ERROR;
+            }
+            return REQUEST_WRITE;
+        }
+        return REQUEST_RESOLV;
+    }
+    return CONNECTING;
+}
+
+static unsigned request_resolv_done(struct selector_key *key) {
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+
+    if (s->origin_resolution == NULL) {
+        req->reply = SOCKS_REPLY_HOST_UNREACHABLE;
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+    s->orig.conn.current = s->origin_resolution;
+    return CONNECTING;
+}
+
+static unsigned request_read(struct selector_key *key) {
+    struct request_st *req = &ATTACHMENT(key)->client.request;
+    bool error = false;
+
+    size_t available;
+    uint8_t *write_ptr = buffer_write_ptr(req->rb, &available);
+    ssize_t received = recv(key->fd, write_ptr, available, 0);
+    if (received <= 0) {
+        return ERROR;
+    }
+    buffer_write_adv(req->rb, received);
+
+    enum request_state st = request_consume(req->rb, &req->parser, &error);
+    if (error) {
+        return ERROR;
+    }
+
+    if (request_is_done(st, NULL)) {
+        return request_process(key);
+    }
+    return REQUEST_READ;
+}
+
+static unsigned request_write(struct selector_key *key) {
+    struct request_st *req = &ATTACHMENT(key)->client.request;
+
+    size_t pending;
+    uint8_t *read_ptr = buffer_read_ptr(req->wb, &pending);
+    ssize_t sent = send(key->fd, read_ptr, pending, 0);
+    if (sent <= 0) {
+        return ERROR;
+    }
+    buffer_read_adv(req->wb, sent);
+
+    if (!buffer_can_read(req->wb)) {
+        if (req->reply == SOCKS_REPLY_SUCCEEDED) {
+            if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
+                return ERROR;
+            }
+            return COPY;
+        }
+        return DONE;
+    }
+    return REQUEST_WRITE;
+}
+
+/*
+ * Tries to create a non-blocking socket and connect to addr.
+ * Stores the new fd in s->origin_fd on success.
+ * Returns 0 if connect() succeeded or returned EINPROGRESS, -1 otherwise.
+ */
+static int
+connecting_try_one(struct socks5 *s, const struct sockaddr *addr, socklen_t addrlen)
+{
+    int fd = socket(addr->sa_family, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    if (selector_fd_set_nio(fd) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (connect(fd, addr, addrlen) < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    s->origin_fd = fd;
+    return 0;
+}
+
+/*
+ * Iterates s->orig.conn.current (addrinfo list from DNS).
+ * On the first address that accepts a connect(), registers origin_fd with
+ * OP_WRITE and increments s->references.
+ * If all addresses are exhausted, sets client_fd to OP_WRITE so
+ * connecting_write can send the error reply.
+ */
+static void
+connecting_try_addrinfo(struct selector_key *key)
+{
+    struct socks5 *s = ATTACHMENT(key);
+
+    while (s->orig.conn.current != NULL) {
+        struct addrinfo *ai = s->orig.conn.current;
+        s->orig.conn.current = ai->ai_next;
+
+        if (connecting_try_one(s, ai->ai_addr, ai->ai_addrlen) == 0) {
+            s->references++;
+            selector_register(key->s, s->origin_fd, &socks5_handler, OP_WRITE, s);
+            return;
+        }
+        s->orig.conn.reply = errno_to_socks_reply(errno);
+    }
+    selector_set_interest(key->s, s->client_fd, OP_WRITE);
+}
+
+static void
+connecting_init(const unsigned state, struct selector_key *key)
+{
+    (void)state;
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+    s->orig.conn.reply = SOCKS_REPLY_GENERAL_FAILURE;
+
+    if (s->orig.conn.current != NULL) {
+        /* FQDN */
+        connecting_try_addrinfo(key);
+    } else {
+        /* IPv4/IPv6 */
+        struct sockaddr_storage ss;
+        socklen_t sslen;
+        memset(&ss, 0, sizeof(ss));
+
+        if (req->request.dest_addr.type == SOCKS_ATYP_IPV4) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+            sin->sin_family = AF_INET;
+            sin->sin_addr = req->request.dest_addr.ipv4;
+            sin->sin_port = htons(req->request.dest_port);
+            sslen = sizeof(*sin);
+        } else {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_addr = req->request.dest_addr.ipv6;
+            sin6->sin6_port = htons(req->request.dest_port);
+            sslen = sizeof(*sin6);
+        }
+
+        if (connecting_try_one(s, (struct sockaddr *)&ss, sslen) == 0) {
+            s->references++;
+            selector_register(key->s, s->origin_fd, &socks5_handler, OP_WRITE, s);
+        } else {
+            s->orig.conn.reply = errno_to_socks_reply(errno);
+            selector_set_interest(key->s, s->client_fd, OP_WRITE);
+        }
+    }
+}
+
+static unsigned
+connecting_write(struct selector_key *key)
+{
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+
+    if (key->fd == s->client_fd) {
+        /* Connect failed */
+        req->reply = s->orig.conn.reply;
+        if (g_metrics != NULL) {
+            metrics_origin_fail(g_metrics);
+        }
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(key->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+        err = errno;
+    }
+
+    if (err == 0) {
+        /* Connect succeeded */
+        if (g_metrics != NULL) {
+            metrics_origin_ok(g_metrics);
+        }
+        req->reply = SOCKS_REPLY_SUCCEEDED;
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        if (selector_set_interest(key->s, s->client_fd, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        if (selector_set_interest_key(key, OP_NOOP) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+
+    /* Connect failed on this address */
+    s->orig.conn.reply = errno_to_socks_reply(err);
+    selector_unregister_fd(key->s, s->origin_fd);
+    close(s->origin_fd);
+    s->origin_fd = -1;
+
+    if (s->orig.conn.current != NULL) {
+        /* More addresses to try (FQDN with multiple IPs) */
+        connecting_try_addrinfo(key);
+        return CONNECTING;
+    }
+
+    /* No more addresses */
+    if (g_metrics != NULL) {
+        metrics_origin_fail(g_metrics);
+    }
+    req->reply = s->orig.conn.reply;
+    if (request_marshall(req->wb, req->reply) < 0) {
+        return ERROR;
+    }
+    if (selector_set_interest(key->s, s->client_fd, OP_WRITE) != SELECTOR_SUCCESS) {
+        return ERROR;
+    }
+    return REQUEST_WRITE;
+}
+
 static const struct state_definition client_statbl[] = {
     {
         .state = HELLO_READ,
@@ -314,19 +594,21 @@ static const struct state_definition client_statbl[] = {
     },
     {
         .state = REQUEST_READ,
-        .on_read_ready = unimplemented_read,
+        .on_arrival = request_read_init,
+        .on_read_ready = request_read,
     },
     {
         .state = REQUEST_RESOLV,
-        .on_block_ready = unimplemented_block,
+        .on_block_ready = request_resolv_done,
     },
     {
         .state = CONNECTING,
-        .on_write_ready = unimplemented_write,
+        .on_arrival = connecting_init,
+        .on_write_ready = connecting_write,
     },
     {
         .state = REQUEST_WRITE,
-        .on_write_ready = unimplemented_write,
+        .on_write_ready = request_write,
     },
     {
         .state = COPY,

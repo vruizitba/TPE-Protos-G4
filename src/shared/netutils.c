@@ -12,6 +12,7 @@
 #endif
 
 #include "netutils.h"
+#include "socks5.h"
 
 #define N(x) (sizeof(x)/sizeof((x)[0]))
 
@@ -78,6 +79,23 @@ sock_blocking_write(const int fd, buffer *b) {
     } while (buffer_can_read(b));
 
     return ret;
+}
+
+uint8_t
+errno_to_socks_reply(int err)
+{
+    switch (err) {
+        case ECONNREFUSED:
+            return SOCKS_REPLY_CONN_REFUSED;
+        case ENETUNREACH:
+            return SOCKS_REPLY_NET_UNREACHABLE;
+        case EHOSTUNREACH:
+            return SOCKS_REPLY_HOST_UNREACHABLE;
+        case ETIMEDOUT:
+            return SOCKS_REPLY_TTL_EXPIRED;
+        default:
+            return SOCKS_REPLY_GENERAL_FAILURE;
+    }
 }
 
 int
