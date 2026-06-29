@@ -293,6 +293,89 @@ static unsigned auth_write(struct selector_key *key) {
     return AUTH_WRITE;
 }
 
+static void request_read_init(const unsigned state, struct selector_key *key) {
+    (void)state;
+    struct request_st *req = &ATTACHMENT(key)->client.request;
+    req->rb = &ATTACHMENT(key)->read_buffer;
+    req->wb = &ATTACHMENT(key)->write_buffer;
+    req->reply = SOCKS_REPLY_GENERAL_FAILURE;
+    req->parser.request = &req->request;
+    request_parser_init(&req->parser);
+}
+
+static unsigned request_process(struct selector_key *key) {
+    struct socks5 *s = ATTACHMENT(key);
+    struct request_st *req = &s->client.request;
+    enum request_state st = req->parser.state;
+
+    if (st == request_error_unsupported_cmd || st == request_error_unsupported_atyp) {
+        req->reply = (st == request_error_unsupported_cmd)
+            ? SOCKS_REPLY_CMD_NOT_SUPPORTED
+            : SOCKS_REPLY_ATYP_NOT_SUPPORTED;
+        if (request_marshall(req->wb, req->reply) < 0) {
+            return ERROR;
+        }
+        if (selector_set_interest_key(key, OP_WRITE) != SELECTOR_SUCCESS) {
+            return ERROR;
+        }
+        return REQUEST_WRITE;
+    }
+    /* request_done: proceed to DNS resolution or direct connect */
+    if (selector_set_interest_key(key, OP_NOOP) != SELECTOR_SUCCESS) {
+        return ERROR;
+    }
+    if (req->request.dest_addr.type == SOCKS_ATYP_FQDN) {
+        return REQUEST_RESOLV;
+    }
+    return CONNECTING;
+}
+
+static unsigned request_read(struct selector_key *key) {
+    struct request_st *req = &ATTACHMENT(key)->client.request;
+    bool error = false;
+
+    size_t available;
+    uint8_t *write_ptr = buffer_write_ptr(req->rb, &available);
+    ssize_t received = recv(key->fd, write_ptr, available, 0);
+    if (received <= 0) {
+        return ERROR;
+    }
+    buffer_write_adv(req->rb, received);
+
+    enum request_state st = request_consume(req->rb, &req->parser, &error);
+    if (error) {
+        return ERROR;
+    }
+
+    if (request_is_done(st, NULL)) {
+        return request_process(key);
+    }
+    return REQUEST_READ;
+}
+
+static unsigned request_write(struct selector_key *key) {
+    struct request_st *req = &ATTACHMENT(key)->client.request;
+
+    size_t pending;
+    uint8_t *read_ptr = buffer_read_ptr(req->wb, &pending);
+    ssize_t sent = send(key->fd, read_ptr, pending, 0);
+    if (sent <= 0) {
+        return ERROR;
+    }
+    buffer_read_adv(req->wb, sent);
+
+    if (!buffer_can_read(req->wb)) {
+        if (req->reply == SOCKS_REPLY_SUCCEEDED) {
+            if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
+                return ERROR;
+            }
+            return COPY;
+        }
+        return DONE;
+    }
+    return REQUEST_WRITE;
+}
+
 static const struct state_definition client_statbl[] = {
     {
         .state = HELLO_READ,
@@ -314,7 +397,8 @@ static const struct state_definition client_statbl[] = {
     },
     {
         .state = REQUEST_READ,
-        .on_read_ready = unimplemented_read,
+        .on_arrival = request_read_init,
+        .on_read_ready = request_read,
     },
     {
         .state = REQUEST_RESOLV,
@@ -326,7 +410,7 @@ static const struct state_definition client_statbl[] = {
     },
     {
         .state = REQUEST_WRITE,
-        .on_write_ready = unimplemented_write,
+        .on_write_ready = request_write,
     },
     {
         .state = COPY,
