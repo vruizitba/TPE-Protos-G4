@@ -33,7 +33,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 # check (libcheck): use homebrew prefix if present, else system paths
 CHECK_PREFIX=$(shell brew --prefix check 2>/dev/null)
 CHECK_CFLAGS=$(if $(CHECK_PREFIX),-I$(CHECK_PREFIX)/include,)
-CHECK_LIBS=$(if $(CHECK_PREFIX),-L$(CHECK_PREFIX)/lib -lcheck,-lcheck)
+CHECK_LIBS=$(if $(CHECK_PREFIX),-L$(CHECK_PREFIX)/lib -lcheck,-lcheck -lsubunit -lm)
 
 # check.h relies on GNU extensions, so drop -Wpedantic/-Werror for tests.
 TEST_COMPILER_FLAGS=$(filter-out -Wpedantic -Werror,$(COMPILER_FLAGS))

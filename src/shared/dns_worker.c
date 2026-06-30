@@ -4,9 +4,10 @@
 #include <stdio.h>
 #include <netdb.h>
 #include "dns_worker.h"
+#include "request.h"
 
 #define PORT_STR_LEN 6 /* "65535\0" */
-#define HOST_MAX_LEN 256
+#define HOST_MAX_LEN (MAX_FQDN_LEN + 1)
 
 typedef struct dns_job {
     char host[HOST_MAX_LEN];

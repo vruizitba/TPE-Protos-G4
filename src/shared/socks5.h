@@ -3,6 +3,7 @@
 
 /* SOCKS5 protocol constants (RFC1928) */
 #define SOCKS_VERSION 0x05
+#define SOCKS_RSV     0x00
 
 /* Authentication methods */
 #define SOCKS_HELLO_NOAUTHENTICATION_REQUIRED 0x00

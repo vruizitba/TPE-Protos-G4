@@ -154,7 +154,7 @@ request_marshall(buffer *b, uint8_t reply)
     }
     write_ptr[0] = SOCKS_VERSION;
     write_ptr[1] = reply;
-    write_ptr[2] = 0x00;           /* RSV */
+    write_ptr[2] = SOCKS_RSV;
     write_ptr[3] = SOCKS_ATYP_IPV4;
     write_ptr[4] = 0;              /* BND.ADDR: 0.0.0.0 */
     write_ptr[5] = 0;
