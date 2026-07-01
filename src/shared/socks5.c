@@ -121,6 +121,7 @@ static unsigned pool_size;
 static const unsigned max_pool = 50;
 static users_t *g_users = NULL;
 static metrics_t *g_metrics = NULL;
+static unsigned g_active_sessions = 0;
 static dns_worker_t *g_dns_worker = NULL;
 
 static unsigned unimplemented_read(struct selector_key *key) {
@@ -715,6 +716,12 @@ socksv5_block(struct selector_key *key) {
 static void
 socksv5_close(struct selector_key *key) {
     struct socks5 * s=ATTACHMENT(key);
+    if (g_active_sessions > 0) {
+        g_active_sessions--;
+    }
+    if (g_metrics != NULL) {
+        metrics_conn_closed(g_metrics);
+    }
     socks5_destroy(s);
 }
 
@@ -753,12 +760,25 @@ socksv5_passive_accept(struct selector_key *key) {
                                               OP_READ, state)) {
         goto fail;
     }
+    g_active_sessions++;
+    if (g_metrics != NULL) {
+        metrics_conn_accepted(g_metrics);
+    }
     return ;
 fail:
     if(client != -1) {
         close(client);
     }
+    if (g_metrics != NULL) {
+        metrics_conn_rejected(g_metrics);
+    }
     socks5_destroy(state);
+}
+
+unsigned
+socksv5_active_sessions(void)
+{
+    return g_active_sessions;
 }
 
 static struct socks5*
@@ -792,4 +812,3 @@ socks5_new(int client_fd) {
 
     return s;
 }
-
