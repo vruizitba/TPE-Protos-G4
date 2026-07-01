@@ -1,9 +1,11 @@
 #ifndef NETUTILS_H_CTCyWGhkVt1pazNytqIRptmAi5U
 #define NETUTILS_H_CTCyWGhkVt1pazNytqIRptmAi5U
 
+#include <stdint.h>
 #include <netinet/in.h>
 
 #include "buffer.h"
+#include "socks5.h"
 
 #define SOCKADDR_TO_HUMAN_MIN (INET6_ADDRSTRLEN + 5 + 1)
 /**
@@ -39,5 +41,8 @@ sock_blocking_write(const int fd, buffer *b);
  */
 int
 sock_blocking_copy(const int source, const int dest);
+
+/* Maps connect(2) errno values to SOCKS5 reply codes */
+uint8_t errno_to_socks_reply(int err);
 
 #endif

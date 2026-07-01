@@ -3,6 +3,7 @@
 
 /* SOCKS5 protocol constants (RFC1928) */
 #define SOCKS_VERSION 0x05
+#define SOCKS_RSV     0x00
 
 /* Authentication methods */
 #define SOCKS_HELLO_NOAUTHENTICATION_REQUIRED 0x00
@@ -18,6 +19,10 @@
 #define SOCKS_ATYP_IPV4 0x01
 #define SOCKS_ATYP_FQDN 0x03
 #define SOCKS_ATYP_IPV6 0x04
+
+/* Address lengths in bytes */
+#define SOCKS_ATYP_IPV4_LEN 4
+#define SOCKS_ATYP_IPV6_LEN 16
 
 /* Reply codes */
 #define SOCKS_REPLY_SUCCEEDED 0x00
