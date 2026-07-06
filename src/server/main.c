@@ -28,6 +28,7 @@
 #include "socks5nio.h"
 #include "mng.h"
 #include "users.h"
+#include "access_log.h"
 
 #define LISTEN_BACKLOG 20
 #define SELECTOR_TIMEOUT_SECS 10
@@ -45,7 +46,7 @@ sigterm_handler(const int signal)
 
 static void
 cleanup(fd_selector selector, int socks_fd, int mng_fd, users_t *users,
-        metrics_t *metrics, dns_worker_t *dns_worker)
+        metrics_t *metrics, dns_worker_t *dns_worker, access_log_t *access_log)
 {
     dns_worker_destroy(dns_worker);
     if (selector != NULL) {
@@ -62,6 +63,8 @@ cleanup(fd_selector selector, int socks_fd, int mng_fd, users_t *users,
     }
     users_destroy(users);
     metrics_destroy(metrics);
+
+    access_log_destroy(access_log);
 }
 
 static int
@@ -119,19 +122,20 @@ main(const int argc, const char **argv)
     users_t *users = users_create();
     metrics_t *metrics = metrics_create();
     config_t config;
+    access_log_t *access_log = access_log_create(args.access_log);
     config_init(&config);
     config_set_defaults(&config, args.negotiation_timeout, args.connect_timeout,
                         args.idle_timeout, args.max_connections);
 
-    if (users == NULL || metrics == NULL) {
+    if (users == NULL || metrics == NULL || access_log == NULL) {
         fprintf(stderr, "unable to allocate shared state\n");
-        cleanup(NULL, -1, -1, users, metrics, NULL);
+        cleanup(NULL, -1, -1, users, metrics, NULL, access_log);
         return 1;
     }
     for (int i = 0; i < MAX_USERS && args.users[i].name != NULL; i++) {
         if (!users_add(users, args.users[i].name, args.users[i].pass)) {
             fprintf(stderr, "unable to add configured user: %s\n", args.users[i].name);
-            cleanup(NULL, -1, -1, users, metrics, NULL);
+            cleanup(NULL, -1, -1, users, metrics, NULL, access_log);
             return 1;
         }
     }
@@ -144,13 +148,14 @@ main(const int argc, const char **argv)
 
     socks_fd = passive_socket(args.socks_addr, args.socks_port);
     if (socks_fd < 0) {
+        cleanup(NULL, -1, -1, users, metrics, NULL, access_log);
         return 1;
     }
     fprintf(stdout, "SOCKS5 listening on %s:%hu\n", args.socks_addr, args.socks_port);
 
     mng_fd = passive_socket(args.mng_addr, args.mng_port);
     if (mng_fd < 0) {
-        cleanup(NULL, socks_fd, -1, users, metrics, NULL);
+        cleanup(NULL, socks_fd, -1, users, metrics, NULL, access_log);
         return 1;
     }
     fprintf(stdout, "Management listening on %s:%hu\n", args.mng_addr, args.mng_port);
@@ -160,7 +165,7 @@ main(const int argc, const char **argv)
 
     if (selector_fd_set_nio(socks_fd) == -1 || selector_fd_set_nio(mng_fd) == -1) {
         perror("setting non-blocking mode");
-        cleanup(NULL, socks_fd, mng_fd, users, metrics, NULL);
+        cleanup(NULL, socks_fd, mng_fd, users, metrics, NULL, access_log);
         return 1;
     }
 
@@ -170,27 +175,28 @@ main(const int argc, const char **argv)
     };
     if (selector_init(&conf) != 0) {
         perror("initializing selector");
-        cleanup(NULL, socks_fd, mng_fd, users, metrics, NULL);
+        cleanup(NULL, socks_fd, mng_fd, users, metrics, NULL, access_log);
         return 1;
     }
 
     selector = selector_new(SELECTOR_MAX_FDS);
     if (selector == NULL) {
         perror("unable to create selector");
-        cleanup(NULL, socks_fd, mng_fd, users, metrics, NULL);
+        cleanup(NULL, socks_fd, mng_fd, users, metrics, NULL, access_log);
         return 1;
     }
 
     dns_worker = dns_worker_create();
     if (dns_worker == NULL) {
         fprintf(stderr, "unable to create DNS worker\n");
-        cleanup(selector, socks_fd, mng_fd, users, metrics, NULL);
+        cleanup(selector, socks_fd, mng_fd, users, metrics, NULL, access_log);
         return 1;
     }
 
     socksv5_set_users(users);
     socksv5_set_metrics(metrics);
     socksv5_set_dns_worker(dns_worker);
+    socksv5_set_access_log(access_log);
     mng_set_context(args.admin_secret, users, metrics, &config);
 
     const struct fd_handler socks_handler = {
@@ -202,7 +208,7 @@ main(const int argc, const char **argv)
     if (ss != SELECTOR_SUCCESS) {
         fprintf(stderr, "registering SOCKS5 fd: %s\n",
                 ss == SELECTOR_IO ? strerror(errno) : selector_error(ss));
-        cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker);
+        cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker, access_log);
         return 1;
     }
 
@@ -215,7 +221,7 @@ main(const int argc, const char **argv)
     if (ss != SELECTOR_SUCCESS) {
         fprintf(stderr, "registering management fd: %s\n",
                 ss == SELECTOR_IO ? strerror(errno) : selector_error(ss));
-        cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker);
+        cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker, access_log);
         return 1;
     }
 
@@ -247,11 +253,11 @@ main(const int argc, const char **argv)
         if (ss != SELECTOR_SUCCESS) {
             fprintf(stderr, "serving: %s\n",
                     ss == SELECTOR_IO ? strerror(errno) : selector_error(ss));
-            cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker);
+            cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker, access_log);
             return 1;
         }
     }
 
-    cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker);
+    cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker, access_log);
     return 0;
 }

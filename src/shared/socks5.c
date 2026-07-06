@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -19,8 +20,10 @@
 #include "users.h"
 #include "metrics.h"
 #include "dns_worker.h"
+#include "access_log.h"
 
 #define BUFFER_SIZE 4096
+#define DESTINATION_MAX_LEN (MAX_FQDN_LEN + 1)
 #define N(x) (sizeof(x) / sizeof((x)[0]))
 
 enum socks_v5state{
@@ -46,6 +49,7 @@ struct hello_st {
 struct auth_st {
     buffer *rb, *wb;
     struct auth_parser parser;
+    uint8_t status;
 };
 
 struct request_st {
@@ -103,13 +107,19 @@ struct socks5 {
     struct socks5 *next;    
 
     char authenticated_user[256];
+    char destination[DESTINATION_MAX_LEN];
+    uint16_t destination_port;
+    bool destination_set;
+    bool tunnel_opened;
+    bool log_emitted;
+    const char *failure_reason;
 };
 
 #define ATTACHMENT(key) ((struct socks5 *)(key)->data)
 
 static struct socks5 *socks5_new(int client_fd);
 static void socks5_destroy(struct socks5 *s);
-static void socksv5_done(struct selector_key *key);
+static void socksv5_done(struct selector_key *key, bool clean_close);
 static void socksv5_read(struct selector_key *key);
 static void socksv5_write(struct selector_key *key);
 static void socksv5_block(struct selector_key *key);
@@ -123,6 +133,77 @@ static users_t *g_users = NULL;
 static metrics_t *g_metrics = NULL;
 static unsigned g_active_sessions = 0;
 static dns_worker_t *g_dns_worker = NULL;
+static access_log_t *g_access_log = NULL;
+
+static const char *
+socks5_log_user(struct socks5 *s)
+{
+    return s->authenticated_user[0] != '\0' ? s->authenticated_user : NULL;
+}
+
+static void
+socks5_log_event(struct socks5 *s, bool clean_close)
+{
+    if (g_access_log == NULL || s->log_emitted || !s->destination_set) {
+        return;
+    }
+
+    if (s->tunnel_opened && clean_close) {
+        access_log_close(g_access_log, socks5_log_user(s), s->destination,
+                         s->destination_port, s->client.copy.transferred,
+                         s->orig.copy.transferred);
+    } else {
+        access_log_fail(g_access_log, socks5_log_user(s), s->destination,
+                        s->destination_port, s->failure_reason);
+    }
+    s->log_emitted = true;
+}
+
+static void
+socks5_log_open(struct socks5 *s)
+{
+    if (g_access_log == NULL || !s->destination_set || s->tunnel_opened) {
+        return;
+    }
+    access_log_open(g_access_log, socks5_log_user(s), s->destination,
+                    s->destination_port);
+    s->tunnel_opened = true;
+}
+
+static void
+socks5_set_failure(struct socks5 *s, const char *reason)
+{
+    if (s->failure_reason == NULL) {
+        s->failure_reason = reason;
+    }
+}
+
+static bool
+socks5_store_destination(struct socks5 *s, const struct socks5_request *request)
+{
+    const char *stored = NULL;
+
+    if (request->dest_addr.type == SOCKS_ATYP_FQDN) {
+        strncpy(s->destination, request->dest_addr.fqdn,
+                sizeof(s->destination) - 1);
+        s->destination[sizeof(s->destination) - 1] = '\0';
+        stored = s->destination;
+    } else if (request->dest_addr.type == SOCKS_ATYP_IPV4) {
+        stored = inet_ntop(AF_INET, &request->dest_addr.ipv4,
+                           s->destination, sizeof(s->destination));
+    } else if (request->dest_addr.type == SOCKS_ATYP_IPV6) {
+        stored = inet_ntop(AF_INET6, &request->dest_addr.ipv6,
+                           s->destination, sizeof(s->destination));
+    }
+
+    if (stored == NULL) {
+        socks5_set_failure(s, "invalid destination");
+        return false;
+    }
+    s->destination_port = request->dest_port;
+    s->destination_set = true;
+    return true;
+}
 
 static void on_hello_method(struct hello_parser *parser, uint8_t method) {
     uint8_t *selected = parser->data;
@@ -200,7 +281,7 @@ static unsigned hello_write(struct selector_key *key) {
         if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
             return ERROR;
         }
-        return hello->method == SOCKS_HELLO_USERNAME_PASSWORD ? AUTH_READ : DONE;
+        return hello->method == SOCKS_HELLO_USERNAME_PASSWORD ? AUTH_READ : REQUEST_READ;
     }
     return HELLO_WRITE;
 }
@@ -217,18 +298,23 @@ void socksv5_set_dns_worker(dns_worker_t *w) {
     g_dns_worker = w;
 }
 
+void socksv5_set_access_log(access_log_t *log) {
+    g_access_log = log;
+}
+
 static void auth_read_init(const unsigned state, struct selector_key *key) {
     (void)state;
     struct auth_st *auth = &ATTACHMENT(key)->client.auth;
     auth->rb = &ATTACHMENT(key)->read_buffer;
     auth->wb = &ATTACHMENT(key)->write_buffer;
+    auth->status = 0x01;
     auth_parser_init(&auth->parser);
 }
 
 static unsigned auth_process(struct auth_st *auth, struct socks5 *session) {
-    uint8_t status = 0x01;
+    auth->status = 0x01;
     if (g_users == NULL || users_check(g_users, auth->parser.uname, auth->parser.passwd)) {
-        status = 0x00;
+        auth->status = 0x00;
         strncpy(session->authenticated_user, auth->parser.uname,
                 sizeof(session->authenticated_user) - 1);
         session->authenticated_user[sizeof(session->authenticated_user) - 1] = '\0';
@@ -237,7 +323,7 @@ static unsigned auth_process(struct auth_st *auth, struct socks5 *session) {
             metrics_auth_fail(g_metrics);
         }
     }
-    if (auth_marshall(auth->wb, status) < 0) {
+    if (auth_marshall(auth->wb, auth->status) < 0) {
         return ERROR;
     }
     return AUTH_WRITE;
@@ -284,7 +370,7 @@ static unsigned auth_write(struct selector_key *key) {
         if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
             return ERROR;
         }
-        return DONE;
+        return auth->status == 0x00 ? REQUEST_READ : DONE;
     }
     return AUTH_WRITE;
 }
@@ -308,6 +394,9 @@ static unsigned request_process(struct selector_key *key) {
         req->reply = (st == request_error_unsupported_cmd)
             ? SOCKS_REPLY_CMD_NOT_SUPPORTED
             : SOCKS_REPLY_ATYP_NOT_SUPPORTED;
+        socks5_set_failure(s, st == request_error_unsupported_cmd
+                           ? "unsupported command"
+                           : "unsupported address type");
         if (request_marshall(req->wb, req->reply) < 0) {
             return ERROR;
         }
@@ -317,6 +406,9 @@ static unsigned request_process(struct selector_key *key) {
         return REQUEST_WRITE;
     }
     /* request_done: proceed to DNS resolution or direct connect */
+    if (!socks5_store_destination(s, &req->request)) {
+        return ERROR;
+    }
     if (selector_set_interest_key(key, OP_NOOP) != SELECTOR_SUCCESS) {
         return ERROR;
     }
@@ -327,6 +419,7 @@ static unsigned request_process(struct selector_key *key) {
                               req->request.dest_port,
                               &s->origin_resolution,
                               key->s) != 0) {
+            socks5_set_failure(s, "dns submit failed");
             req->reply = SOCKS_REPLY_GENERAL_FAILURE;
             if (request_marshall(req->wb, req->reply) < 0) {
                 return ERROR;
@@ -346,6 +439,7 @@ static unsigned request_resolv_done(struct selector_key *key) {
     struct request_st *req = &s->client.request;
 
     if (s->origin_resolution == NULL) {
+        socks5_set_failure(s, "dns resolution failed");
         req->reply = SOCKS_REPLY_HOST_UNREACHABLE;
         if (request_marshall(req->wb, req->reply) < 0) {
             return ERROR;
@@ -373,6 +467,7 @@ static unsigned request_read(struct selector_key *key) {
 
     enum request_state st = request_consume(req->rb, &req->parser, &error);
     if (error) {
+        socks5_set_failure(ATTACHMENT(key), "invalid request");
         return ERROR;
     }
 
@@ -452,6 +547,7 @@ connecting_try_addrinfo(struct selector_key *key)
         }
         s->orig.conn.reply = errno_to_socks_reply(errno);
     }
+    socks5_set_failure(s, "connect failed");
     selector_set_interest(key->s, s->client_fd, OP_WRITE);
 }
 
@@ -491,6 +587,7 @@ connecting_init(const unsigned state, struct selector_key *key)
             selector_register(key->s, s->origin_fd, &socks5_handler, OP_WRITE, s);
         } else {
             s->orig.conn.reply = errno_to_socks_reply(errno);
+            socks5_set_failure(s, "connect failed");
             selector_set_interest(key->s, s->client_fd, OP_WRITE);
         }
     }
@@ -504,6 +601,7 @@ connecting_write(struct selector_key *key)
 
     if (key->fd == s->client_fd) {
         /* Connect failed */
+        socks5_set_failure(s, "connect failed");
         req->reply = s->orig.conn.reply;
         if (g_metrics != NULL) {
             metrics_origin_fail(g_metrics);
@@ -551,6 +649,7 @@ connecting_write(struct selector_key *key)
     }
 
     /* No more addresses */
+    socks5_set_failure(s, "connect failed");
     if (g_metrics != NULL) {
         metrics_origin_fail(g_metrics);
     }
@@ -671,6 +770,7 @@ copy_init(const unsigned state, struct selector_key *key)
     s->orig.copy.write_closed = false;
     s->orig.copy.transferred = 0;
 
+    socks5_log_open(s);
     copy_update_interests(key);
 }
 
@@ -860,10 +960,13 @@ socksv5_pool_destroy(void) {
 }
 
 static void
-socksv5_done(struct selector_key* key) {
+socksv5_done(struct selector_key* key, bool clean_close) {
+    struct socks5 *s = ATTACHMENT(key);
+    socks5_log_event(s, clean_close);
+
     const int fds[] = {
-        ATTACHMENT(key)->client_fd,
-        ATTACHMENT(key)->origin_fd,
+        s->client_fd,
+        s->origin_fd,
     };
     for(unsigned i = 0; i < N(fds); i++) {
         if(fds[i] != -1) {
@@ -881,7 +984,10 @@ socksv5_read(struct selector_key *key) {
     const enum socks_v5state st =stm_handler_read(stm, key);
 
     if(st == ERROR || st == DONE) {
-        socksv5_done(key);
+        if (st == ERROR) {
+            socks5_set_failure(ATTACHMENT(key), "read error");
+        }
+        socksv5_done(key, st == DONE);
     }
 }
 
@@ -891,7 +997,10 @@ socksv5_write(struct selector_key *key) {
     const enum socks_v5state st = stm_handler_write(stm, key);
 
     if(st == ERROR || st == DONE) {
-        socksv5_done(key);
+        if (st == ERROR) {
+            socks5_set_failure(ATTACHMENT(key), "write error");
+        }
+        socksv5_done(key, st == DONE);
     }
 }
 
@@ -901,7 +1010,10 @@ socksv5_block(struct selector_key *key) {
     const enum socks_v5state st = stm_handler_block(stm, key);
 
     if(st == ERROR || st == DONE) {
-        socksv5_done(key);
+        if (st == ERROR) {
+            socks5_set_failure(ATTACHMENT(key), "block error");
+        }
+        socksv5_done(key, st == DONE);
     }
 }
 
