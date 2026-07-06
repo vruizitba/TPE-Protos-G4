@@ -124,16 +124,6 @@ static metrics_t *g_metrics = NULL;
 static unsigned g_active_sessions = 0;
 static dns_worker_t *g_dns_worker = NULL;
 
-static unsigned unimplemented_read(struct selector_key *key) {
-    (void)key;
-    return ERROR;
-}
-
-static unsigned unimplemented_write(struct selector_key *key) {
-    (void)key;
-    return ERROR;
-}
-
 static void on_hello_method(struct hello_parser *parser, uint8_t method) {
     uint8_t *selected = parser->data;
     if (method == SOCKS_HELLO_USERNAME_PASSWORD) {
@@ -574,6 +564,207 @@ connecting_write(struct selector_key *key)
     return REQUEST_WRITE;
 }
 
+static bool
+copy_is_done(struct socks5 *s)
+{
+    return s->client.copy.write_closed && s->orig.copy.write_closed;
+}
+
+static int
+copy_shutdown_write(struct copy *copy)
+{
+    if (copy->eof && !buffer_can_read(copy->rb) && !copy->write_closed) {
+        if (shutdown(copy->write_fd, SHUT_WR) < 0
+            && errno != ENOTCONN && errno != EPIPE) {
+            return -1;
+        }
+        copy->write_closed = true;
+    }
+    return 0;
+}
+
+static fd_interest
+copy_client_interest(struct socks5 *s)
+{
+    fd_interest interest = OP_NOOP;
+
+    if (!s->client.copy.eof && buffer_can_write(s->client.copy.rb)) {
+        interest |= OP_READ;
+    }
+    if (!s->orig.copy.write_closed && buffer_can_read(s->orig.copy.rb)) {
+        interest |= OP_WRITE;
+    }
+    return interest;
+}
+
+static fd_interest
+copy_origin_interest(struct socks5 *s)
+{
+    fd_interest interest = OP_NOOP;
+
+    if (!s->orig.copy.eof && buffer_can_write(s->orig.copy.rb)) {
+        interest |= OP_READ;
+    }
+    if (!s->client.copy.write_closed && buffer_can_read(s->client.copy.rb)) {
+        interest |= OP_WRITE;
+    }
+    return interest;
+}
+
+static int
+copy_update_interests(struct selector_key *key)
+{
+    struct socks5 *s = ATTACHMENT(key);
+
+    if (selector_set_interest(key->s, s->client_fd,
+                              copy_client_interest(s)) != SELECTOR_SUCCESS) {
+        return -1;
+    }
+    if (selector_set_interest(key->s, s->origin_fd,
+                              copy_origin_interest(s)) != SELECTOR_SUCCESS) {
+        return -1;
+    }
+    return 0;
+}
+
+static struct copy *
+copy_read_state(struct socks5 *s, int fd)
+{
+    if (fd == s->client_fd) {
+        return &s->client.copy;
+    }
+    if (fd == s->origin_fd) {
+        return &s->orig.copy;
+    }
+    return NULL;
+}
+
+static struct copy *
+copy_write_state(struct socks5 *s, int fd)
+{
+    if (fd == s->client_fd) {
+        return &s->orig.copy;
+    }
+    if (fd == s->origin_fd) {
+        return &s->client.copy;
+    }
+    return NULL;
+}
+
+static void
+copy_init(const unsigned state, struct selector_key *key)
+{
+    (void)state;
+    struct socks5 *s = ATTACHMENT(key);
+
+    s->client.copy.read_fd = s->client_fd;
+    s->client.copy.write_fd = s->origin_fd;
+    s->client.copy.rb = &s->read_buffer;
+    s->client.copy.eof = false;
+    s->client.copy.write_closed = false;
+    s->client.copy.transferred = 0;
+
+    s->orig.copy.read_fd = s->origin_fd;
+    s->orig.copy.write_fd = s->client_fd;
+    s->orig.copy.rb = &s->write_buffer;
+    s->orig.copy.eof = false;
+    s->orig.copy.write_closed = false;
+    s->orig.copy.transferred = 0;
+
+    copy_update_interests(key);
+}
+
+static unsigned
+copy_read(struct selector_key *key)
+{
+    struct socks5 *s = ATTACHMENT(key);
+    struct copy *copy = copy_read_state(s, key->fd);
+    if (copy == NULL) {
+        return ERROR;
+    }
+
+    if (!buffer_can_write(copy->rb)) {
+        buffer_compact(copy->rb);
+    }
+    if (!buffer_can_write(copy->rb)) {
+        return copy_update_interests(key) == 0 ? COPY : ERROR;
+    }
+
+    size_t available;
+    uint8_t *write_ptr = buffer_write_ptr(copy->rb, &available);
+    ssize_t received = recv(copy->read_fd, write_ptr, available, 0);
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return copy_update_interests(key) == 0 ? COPY : ERROR;
+        }
+        return ERROR;
+    }
+    if (received == 0) {
+        copy->eof = true;
+    } else {
+        buffer_write_adv(copy->rb, received);
+    }
+
+    if (copy_shutdown_write(copy) < 0) {
+        return ERROR;
+    }
+    if (copy_is_done(s)) {
+        return DONE;
+    }
+    return copy_update_interests(key) == 0 ? COPY : ERROR;
+}
+
+static unsigned
+copy_write(struct selector_key *key)
+{
+    struct socks5 *s = ATTACHMENT(key);
+    struct copy *copy = copy_write_state(s, key->fd);
+    if (copy == NULL) {
+        return ERROR;
+    }
+
+    if (!buffer_can_read(copy->rb)) {
+        if (copy_shutdown_write(copy) < 0) {
+            return ERROR;
+        }
+        if (copy_is_done(s)) {
+            return DONE;
+        }
+        return copy_update_interests(key) == 0 ? COPY : ERROR;
+    }
+
+    size_t pending;
+    uint8_t *read_ptr = buffer_read_ptr(copy->rb, &pending);
+    ssize_t sent = send(copy->write_fd, read_ptr, pending, 0);
+    if (sent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return copy_update_interests(key) == 0 ? COPY : ERROR;
+        }
+        return ERROR;
+    }
+    if (sent == 0) {
+        return copy_update_interests(key) == 0 ? COPY : ERROR;
+    }
+
+    buffer_read_adv(copy->rb, sent);
+    copy->transferred += (uint64_t)sent;
+    if (copy == &s->client.copy) {
+        if (g_metrics != NULL) {
+            metrics_add_bytes_c2o(g_metrics, (uint64_t)sent);
+        }
+    } else if (g_metrics != NULL) {
+        metrics_add_bytes_o2c(g_metrics, (uint64_t)sent);
+    }
+
+    if (copy_shutdown_write(copy) < 0) {
+        return ERROR;
+    }
+    if (copy_is_done(s)) {
+        return DONE;
+    }
+    return copy_update_interests(key) == 0 ? COPY : ERROR;
+}
+
 static const struct state_definition client_statbl[] = {
     {
         .state = HELLO_READ,
@@ -613,8 +804,9 @@ static const struct state_definition client_statbl[] = {
     },
     {
         .state = COPY,
-        .on_read_ready = unimplemented_read,
-        .on_write_ready = unimplemented_write,
+        .on_arrival = copy_init,
+        .on_read_ready = copy_read,
+        .on_write_ready = copy_write,
     },
     {
         .state = DONE,
