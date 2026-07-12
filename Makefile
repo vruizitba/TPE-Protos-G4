@@ -51,6 +51,19 @@ test: $(TEST_BINS)
 sanitize: COMPILER_FLAGS+=-fsanitize=address,undefined
 sanitize: all
 
+STRESS_DIR=$(TEST_DIR)/stress
+STRESS_ECHO=$(BIN_DIR)/stress_echo
+STRESS_CLIENT=$(BIN_DIR)/stress_client
+
+$(STRESS_ECHO): $(STRESS_DIR)/echo_server.c | $(BIN_DIR)
+	$(COMPILER) $(COMPILER_FLAGS) $< -o $@
+
+$(STRESS_CLIENT): $(STRESS_DIR)/stress_client.c | $(BIN_DIR)
+	$(COMPILER) $(COMPILER_FLAGS) $(LD_FLAGS) $< -o $@
+
+stress: $(SERVER_OUTPUT) $(STRESS_ECHO) $(STRESS_CLIENT)
+	$(STRESS_DIR)/run_stress.sh
+
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
@@ -60,4 +73,4 @@ $(OBJ_DIR):
 clean:
 	rm -rf $(BIN_DIR) $(OBJ_DIR)
 
-.PHONY: all test sanitize clean
+.PHONY: all test sanitize stress clean

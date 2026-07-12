@@ -30,7 +30,7 @@
 #include "users.h"
 #include "access_log.h"
 
-#define LISTEN_BACKLOG 20
+#define LISTEN_BACKLOG 1024
 #define SELECTOR_TIMEOUT_SECS 10
 #define SELECTOR_MAX_FDS 1024
 #define PORT_STR_LEN 6

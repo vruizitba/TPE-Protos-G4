@@ -549,6 +549,20 @@ connecting_try_one(struct socks5 *s, const struct sockaddr *addr, socklen_t addr
     return 0;
 }
 
+/* On failure, cleans up instead of leaving the session stuck forever. */
+static bool
+connecting_register_origin(struct socks5 *s, fd_selector selector)
+{
+    if (selector_register(selector, s->origin_fd, &socks5_handler, OP_WRITE, s)
+        == SELECTOR_SUCCESS) {
+        return true;
+    }
+    s->references--;
+    close(s->origin_fd);
+    s->origin_fd = -1;
+    return false;
+}
+
 /*
  * Iterates s->orig.conn.current (addrinfo list from DNS).
  * On the first address that accepts a connect(), registers origin_fd with
@@ -567,8 +581,11 @@ connecting_try_addrinfo(struct selector_key *key)
 
         if (connecting_try_one(s, ai->ai_addr, ai->ai_addrlen) == 0) {
             s->references++;
-            selector_register(key->s, s->origin_fd, &socks5_handler, OP_WRITE, s);
-            return;
+            if (connecting_register_origin(s, key->s)) {
+                return;
+            }
+            s->orig.conn.reply = SOCKS_REPLY_GENERAL_FAILURE;
+            break;
         }
         s->orig.conn.reply = errno_to_socks_reply(errno);
     }
@@ -611,7 +628,11 @@ connecting_init(const unsigned state, struct selector_key *key)
 
         if (connecting_try_one(s, (struct sockaddr *)&ss, sslen) == 0) {
             s->references++;
-            selector_register(key->s, s->origin_fd, &socks5_handler, OP_WRITE, s);
+            if (!connecting_register_origin(s, key->s)) {
+                s->orig.conn.reply = SOCKS_REPLY_GENERAL_FAILURE;
+                socks5_set_failure(s, "connect failed");
+                selector_set_interest(key->s, s->client_fd, OP_WRITE);
+            }
         } else {
             s->orig.conn.reply = errno_to_socks_reply(errno);
             socks5_set_failure(s, "connect failed");
