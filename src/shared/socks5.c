@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "hello.h"
@@ -21,6 +22,7 @@
 #include "metrics.h"
 #include "dns_worker.h"
 #include "access_log.h"
+#include "config.h"
 
 #define BUFFER_SIZE 4096
 #define DESTINATION_MAX_LEN (MAX_FQDN_LEN + 1)
@@ -104,7 +106,15 @@ struct socks5 {
     } orig;
 
     unsigned references;
-    struct socks5 *next;    
+    struct socks5 *next;
+
+    /* doubly-linked list of live sessions, walked by socksv5_check_timeouts */
+    struct socks5 *active_prev;
+    struct socks5 *active_next;
+
+    time_t negotiation_deadline; /* 0 = disabled */
+    time_t connect_deadline;     /* 0 = disabled, only meaningful in CONNECTING */
+    time_t last_activity;        /* bumped on COPY traffic, for idle_timeout */
 
     char authenticated_user[256];
     char destination[DESTINATION_MAX_LEN];
@@ -134,6 +144,8 @@ static metrics_t *g_metrics = NULL;
 static unsigned g_active_sessions = 0;
 static dns_worker_t *g_dns_worker = NULL;
 static access_log_t *g_access_log = NULL;
+static config_t *g_config = NULL;
+static struct socks5 *g_active_head = NULL;
 
 static const char *
 socks5_log_user(struct socks5 *s)
@@ -302,6 +314,10 @@ void socksv5_set_dns_worker(dns_worker_t *w) {
 
 void socksv5_set_access_log(access_log_t *log) {
     g_access_log = log;
+}
+
+void socksv5_set_config(config_t *c) {
+    g_config = c;
 }
 
 static void auth_read_init(const unsigned state, struct selector_key *key) {
@@ -567,6 +583,8 @@ connecting_init(const unsigned state, struct selector_key *key)
     struct socks5 *s = ATTACHMENT(key);
     struct request_st *req = &s->client.request;
     s->orig.conn.reply = SOCKS_REPLY_GENERAL_FAILURE;
+    s->connect_deadline = (g_config != NULL && g_config->connect_timeout > 0)
+        ? time(NULL) + g_config->connect_timeout : 0;
 
     if (s->orig.conn.current != NULL) {
         /* FQDN */
@@ -670,6 +688,21 @@ connecting_write(struct selector_key *key)
         return ERROR;
     }
     return REQUEST_WRITE;
+}
+
+/* Called on a -c timeout: drop origin_fd and wake client_fd for OP_WRITE,
+ * reusing connecting_write's key->fd == client_fd branch to send the reply. */
+static void
+connecting_timeout(struct socks5 *s, fd_selector selector)
+{
+    if (s->origin_fd != -1) {
+        selector_unregister_fd(selector, s->origin_fd);
+        close(s->origin_fd);
+        s->origin_fd = -1;
+    }
+    s->orig.conn.current = NULL;
+    s->orig.conn.reply = SOCKS_REPLY_TTL_EXPIRED;
+    selector_set_interest(selector, s->client_fd, OP_WRITE);
 }
 
 static bool
@@ -812,6 +845,7 @@ copy_read(struct selector_key *key)
         copy->eof = true;
     } else {
         buffer_write_adv(copy->rb, received);
+        s->last_activity = time(NULL);
     }
 
     if (copy_shutdown_write(copy) < 0) {
@@ -973,6 +1007,17 @@ socksv5_done(struct selector_key* key) {
     struct socks5 *s = ATTACHMENT(key);
     socks5_log_event(s);
 
+    if (s->active_prev != NULL) {
+        s->active_prev->active_next = s->active_next;
+    } else {
+        g_active_head = s->active_next;
+    }
+    if (s->active_next != NULL) {
+        s->active_next->active_prev = s->active_prev;
+    }
+    s->active_prev = NULL;
+    s->active_next = NULL;
+
     if (g_active_sessions > 0) {
         g_active_sessions--;
     }
@@ -1075,6 +1120,14 @@ socksv5_passive_accept(struct selector_key *key) {
     if(selector_fd_set_nio(client) == -1) {
         goto fail;
     }
+    if (g_config != NULL && g_config->max_connections > 0
+        && g_active_sessions >= (unsigned)g_config->max_connections) {
+        close(client);
+        if (g_metrics != NULL) {
+            metrics_conn_rejected(g_metrics);
+        }
+        return;
+    }
     state = socks5_new(client);
     if(state == NULL) {
         // sin un estado, nos es imposible manejaro.
@@ -1110,6 +1163,41 @@ socksv5_active_sessions(void)
     return g_active_sessions;
 }
 
+/* Periodic sweep enforcing -t/-c/-i over every active session. */
+void
+socksv5_check_timeouts(fd_selector selector)
+{
+    const time_t now = time(NULL);
+    struct socks5 *s = g_active_head;
+
+    while (s != NULL) {
+        struct socks5 *next = s->active_next;
+        const enum socks_v5state st = (enum socks_v5state)stm_state(&s->stm);
+
+        if (st == CONNECTING) {
+            if (s->connect_deadline != 0 && now >= s->connect_deadline) {
+                connecting_timeout(s, selector);
+            }
+        } else if (st == COPY) {
+            if (g_config != NULL && g_config->idle_timeout > 0
+                && now - s->last_activity >= g_config->idle_timeout) {
+                socks5_set_failure(s, "idle timeout");
+                struct selector_key key = { .s = selector, .fd = s->client_fd, .data = s };
+                socksv5_done(&key);
+            }
+        } else if (st != DONE && st != ERROR && st != REQUEST_RESOLV) {
+            /* skip REQUEST_RESOLV: the DNS worker may still hold a pointer tied to client_fd */
+            if (s->negotiation_deadline != 0 && now >= s->negotiation_deadline) {
+                socks5_set_failure(s, "negotiation timeout");
+                struct selector_key key = { .s = selector, .fd = s->client_fd, .data = s };
+                socksv5_done(&key);
+            }
+        }
+
+        s = next;
+    }
+}
+
 static struct socks5*
 socks5_new(int client_fd) {
     struct socks5 *s;
@@ -1138,6 +1226,19 @@ socks5_new(int client_fd) {
 
     buffer_init(&s->read_buffer, BUFFER_SIZE, s->raw_read);
     buffer_init(&s->write_buffer, BUFFER_SIZE, s->raw_write);
+
+    const time_t now = time(NULL);
+    s->last_activity = now;
+    s->negotiation_deadline = (g_config != NULL && g_config->negotiation_timeout > 0)
+        ? now + g_config->negotiation_timeout : 0;
+    s->connect_deadline = 0;
+
+    s->active_prev = NULL;
+    s->active_next = g_active_head;
+    if (g_active_head != NULL) {
+        g_active_head->active_prev = s;
+    }
+    g_active_head = s;
 
     return s;
 }

@@ -197,6 +197,7 @@ main(const int argc, const char **argv)
     socksv5_set_metrics(metrics);
     socksv5_set_dns_worker(dns_worker);
     socksv5_set_access_log(access_log);
+    socksv5_set_config(&config);
     mng_set_context(args.admin_secret, users, metrics, &config);
 
     const struct fd_handler socks_handler = {
@@ -256,6 +257,7 @@ main(const int argc, const char **argv)
             cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker, access_log);
             return 1;
         }
+        socksv5_check_timeouts(selector);
     }
 
     cleanup(selector, socks_fd, mng_fd, users, metrics, dns_worker, access_log);
