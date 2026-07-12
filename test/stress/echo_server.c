@@ -1,6 +1,8 @@
 /* Minimal blocking TCP echo server used as the stress test target. Not part
  * of the graded server: just a fixture so stress_client has somewhere to
- * open tunnels to and verify that bytes actually round-trip. */
+ * open tunnels to and verify that bytes actually round-trip. Listens on a
+ * dual-stack IPv6 socket so the same port answers 127.0.0.1, ::1 and
+ * "localhost", letting stress_client exercise all three SOCKS5 ATYPs. */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -39,19 +41,21 @@ main(int argc, char *argv[])
     }
     signal(SIGCHLD, SIG_IGN);
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket");
         return 1;
     }
     int one = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    int v6only = 0;
+    setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
-    struct sockaddr_in addr;
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons((uint16_t)atoi(argv[1]));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons((uint16_t)atoi(argv[1]));
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
@@ -62,7 +66,7 @@ main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "stress echo server listening on 127.0.0.1:%s\n", argv[1]);
+    fprintf(stderr, "stress echo server listening on [::]:%s (dual-stack)\n", argv[1]);
 
     while (1) {
         int client = accept(listen_fd, NULL, NULL);

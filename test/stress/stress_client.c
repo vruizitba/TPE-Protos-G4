@@ -2,8 +2,11 @@
  * running socks5d, round-trips a small payload through each one, and
  * reports how many succeeded and how long the handshake took. All threads
  * synchronize on a barrier right after connecting, so the N tunnels are
- * genuinely open at the same time before any payload is exchanged. Not
- * part of the graded server: a fixture for `make stress`. */
+ * genuinely open at the same time before any payload is exchanged. Tunnels
+ * are split round-robin across the three SOCKS5 ATYPs (IPv4, IPv6, FQDN),
+ * assuming the target (stress_echo) answers on 127.0.0.1, ::1 and
+ * "localhost" alike. Not part of the graded server: a fixture for
+ * `make stress`. */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -16,6 +19,9 @@
 #include <time.h>
 #include <unistd.h>
 
+enum dest_kind { KIND_IPV4 = 0, KIND_IPV6, KIND_FQDN, KIND_COUNT };
+static const char *const kind_name[KIND_COUNT] = { "ipv4", "ipv6", "fqdn" };
+
 struct args {
     const char *socks_host;
     uint16_t socks_port;
@@ -24,12 +30,15 @@ struct args {
     const char *target_host;
     uint16_t target_port;
     int id;
+    enum dest_kind kind;
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t g_barrier;
 static int g_ok;
 static int g_fail;
+static int g_ok_by_kind[KIND_COUNT];
+static int g_fail_by_kind[KIND_COUNT];
 static double g_open_sum;
 static double g_open_max;
 
@@ -67,6 +76,55 @@ write_exact(int fd, const void *buf, size_t n)
         sent += (size_t)w;
     }
     return 0;
+}
+
+/* Fills req[] with a CONNECT request for a->kind (IPv4/IPv6 literal or
+ * FQDN "localhost"), all pointing at the same dual-stack stress_echo
+ * target. Returns the request length, or 0 on a malformed literal. */
+static size_t
+build_connect_request(uint8_t *req, const struct args *a)
+{
+    size_t n = 4;
+    req[0] = 0x05;
+    req[1] = 0x01;
+    req[2] = 0x00;
+
+    switch (a->kind) {
+    case KIND_IPV4: {
+        struct in_addr addr4;
+        if (inet_pton(AF_INET, a->target_host, &addr4) != 1) {
+            return 0;
+        }
+        req[3] = 0x01;
+        memcpy(req + n, &addr4, sizeof(addr4));
+        n += sizeof(addr4);
+        break;
+    }
+    case KIND_IPV6: {
+        struct in6_addr addr6;
+        if (inet_pton(AF_INET6, "::1", &addr6) != 1) {
+            return 0;
+        }
+        req[3] = 0x04;
+        memcpy(req + n, &addr6, sizeof(addr6));
+        n += sizeof(addr6);
+        break;
+    }
+    default: {
+        const char *fqdn = "localhost";
+        size_t len = strlen(fqdn);
+        req[3] = 0x03;
+        req[n++] = (uint8_t)len;
+        memcpy(req + n, fqdn, len);
+        n += len;
+        break;
+    }
+    }
+
+    uint16_t port_be = htons(a->target_port);
+    memcpy(req + n, &port_be, sizeof(port_be));
+    n += sizeof(port_be);
+    return n;
 }
 
 /* Connects and completes the SOCKS5 handshake. Returns true and leaves the
@@ -109,14 +167,13 @@ open_tunnel(int fd, const struct args *a)
         return false;
     }
 
-    struct in_addr target_addr;
-    inet_pton(AF_INET, a->target_host, &target_addr);
-    uint8_t req[10] = { 0x05, 0x01, 0x00, 0x01 };
-    memcpy(req + 4, &target_addr, 4);
-    uint16_t port_be = htons(a->target_port);
-    memcpy(req + 8, &port_be, 2);
-    uint8_t reply[10];
-    if (write_exact(fd, req, sizeof(req)) < 0
+    uint8_t req[262];
+    size_t reqlen = build_connect_request(req, a);
+    if (reqlen == 0) {
+        return false;
+    }
+    uint8_t reply[10]; /* server always replies ATYP=IPv4, BND=0.0.0.0:0 */
+    if (write_exact(fd, req, reqlen) < 0
         || read_exact(fd, reply, sizeof(reply)) < 0 || reply[1] != 0x00) {
         return false;
     }
@@ -167,12 +224,14 @@ run_tunnel(void *arg)
     pthread_mutex_lock(&g_lock);
     if (ok) {
         g_ok++;
+        g_ok_by_kind[a->kind]++;
         g_open_sum += open_seconds;
         if (open_seconds > g_open_max) {
             g_open_max = open_seconds;
         }
     } else {
         g_fail++;
+        g_fail_by_kind[a->kind]++;
     }
     pthread_mutex_unlock(&g_lock);
 
@@ -219,6 +278,7 @@ main(int argc, char *argv[])
         a->target_host = target_host;
         a->target_port = target_port;
         a->id = i;
+        a->kind = (enum dest_kind)(i % KIND_COUNT);
         if (pthread_create(&threads[i], NULL, run_tunnel, a) != 0) {
             fprintf(stderr, "pthread_create failed at thread %d, aborting\n", i);
             free(a);
@@ -234,6 +294,9 @@ main(int argc, char *argv[])
            n, g_ok, g_fail, total);
     if (g_ok > 0) {
         printf("open_time avg=%.3fs max=%.3fs\n", g_open_sum / g_ok, g_open_max);
+    }
+    for (int k = 0; k < KIND_COUNT; k++) {
+        printf("  %s: ok=%d failed=%d\n", kind_name[k], g_ok_by_kind[k], g_fail_by_kind[k]);
     }
 
     free(threads);
