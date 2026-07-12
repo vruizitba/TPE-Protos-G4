@@ -1,0 +1,32 @@
+TPE Protocolos de Comunicación 2026/1 — Grupo 4
+================================================
+
+Este proyecto incorpora y adapta material publicado por la Cátedra de
+Protocolos de Comunicación del ITBA para la cursada y autorizado por la
+consigna del Trabajo Práctico Especial.
+
+La serie de parches docentes utilizada como base identifica como autor a:
+
+    Juan F. Codagnone <juan@leak.com.ar>
+
+De esa serie provienen total o parcialmente los siguientes componentes y sus
+pruebas originales:
+
+    src/shared/tests.h
+    src/shared/buffer.c y buffer.h
+    src/shared/netutils.c y netutils.h
+    src/shared/selector.c y selector.h
+    src/shared/stm.c y stm.h
+
+También se adaptaron el parser de argumentos y el ejemplo inicial de servidor
+SOCKS5 publicados por la Cátedra. El código fue reorganizado, extendido e
+integrado por el Grupo 4 para implementar autenticación, request/connect,
+resolución DNS, relay, administración, métricas, access log, timeouts y apagado
+ordenado.
+
+Los módulos parser.c/parser.h y parser_utils.c/parser_utils.h presentes en los
+parches docentes no forman parte de la versión final porque no eran utilizados.
+
+Los materiales entregados por la Cátedra no incluyen en este repositorio una
+declaración de licencia separada. Este archivo deja constancia de procedencia y
+autoría sin atribuirles una licencia no indicada.

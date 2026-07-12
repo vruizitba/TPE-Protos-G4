@@ -1,0 +1,663 @@
+TRABAJO PRÁCTICO ESPECIAL 2026/1
+PROXY SOCKS5 — GRUPO 4
+
+
+1. Índice
+=========
+
+1. Índice
+2. Descripción detallada de los protocolos diseñados y aplicaciones desarrolladas
+3. Problemas encontrados durante el diseño y la implementación
+4. Limitaciones de la aplicación
+5. Posibles extensiones
+6. Conclusiones
+7. Ejemplos de prueba
+8. Guía de instalación detallada y precisa
+9. Instrucciones para la configuración
+10. Ejemplos de configuración y monitoreo
+11. Documento de diseño del proyecto
+
+Material complementario:
+
+- README.md: compilación, artefactos, opciones y ejemplos rápidos.
+- docs/management-protocol.md: especificación normativa completa del protocolo
+  administrativo.
+- docs/design.md: descripción ampliada de la arquitectura.
+- NOTICE: procedencia y atribución del material docente adaptado.
+
+
+2. Descripción detallada de los protocolos diseñados y aplicaciones desarrolladas
+===============================================================================
+
+2.1. Servidor proxy SOCKS5
+--------------------------
+
+La aplicación bin/socks5d implementa un servidor SOCKS v5 de acuerdo con RFC
+1928 para el comando CONNECT. Acepta múltiples clientes sobre sockets no
+bloqueantes y multiplexa toda la I/O de red en un único event loop. Los destinos
+pueden expresarse como direcciones IPv4, direcciones IPv6 o FQDN.
+
+La negociación comprende tres etapas:
+
+1. Selección de método. Cuando el servidor tiene usuarios configurados exige el
+   método usuario/contraseña (0x02). Sin usuarios acepta el método sin
+   autenticación (0x00).
+2. Autenticación. La subnegociación sigue RFC 1929. El usuario y la clave se
+   comparan con un store volátil de hasta diez usuarios.
+3. Request. Se parsea el comando, tipo de dirección, destino y puerto. CONNECT
+   continúa a resolución/conexión; BIND y UDP ASSOCIATE se rechazan como no
+   soportados.
+
+La implementación utiliza los códigos de respuesta SOCKS5 para distinguir fallo
+general, red inaccesible, host inaccesible, conexión rechazada, timeout, comando
+no soportado y tipo de dirección no soportado.
+
+Para un FQDN, getaddrinfo se ejecuta en un thread dedicado. El resultado vuelve
+al event loop y se prueban las direcciones obtenidas en orden hasta establecer
+una conexión o agotar la lista. Las direcciones literales no usan el worker DNS.
+
+Una vez establecida la conexión se inicia un relay bidireccional. Cada dirección
+posee un buffer acotado de 4096 bytes. Los intereses de lectura y escritura del
+selector dependen del espacio y de los datos pendientes, lo cual implementa
+backpressure. Se contemplan lecturas y escrituras parciales y half-close: al
+recibir EOF se drena el buffer correspondiente antes de ejecutar
+shutdown(SHUT_WR) sobre el peer.
+
+2.2. Servicio de administración y monitoreo
+--------------------------------------------
+
+El mismo proceso abre un segundo listener TCP, independiente del puerto SOCKS,
+por defecto en 127.0.0.1:8080. El servicio forma parte del selector no bloqueante
+y permite consultar métricas, administrar usuarios y cambiar configuración sin
+reiniciar el proxy.
+
+El protocolo es textual, orientado a líneas y compatible con ASCII. Cada pedido
+y respuesta termina en LF. También se acepta CRLF porque el servidor descarta
+CR. Los tokens se separan por espacios; no existen comillas ni escapes. Los
+comandos son sensibles a mayúsculas. Una línea puede contener hasta 1023 bytes,
+sin contar LF.
+
+Las respuestas exitosas comienzan con +OK y las fallidas con -ERR. Cada
+respuesta ocupa una línea y el cliente debe esperar la respuesta antes de enviar
+otro pedido.
+
+Autenticación administrativa:
+
+    AUTH <secreto>
+
+El secreto se configura con -a y es independiente de los usuarios SOCKS. Una
+autenticación correcta responde:
+
+    +OK authenticated
+
+Un secreto incorrecto responde -ERR invalid credentials. Cada sesión permite
+como máximo tres fallos. En el tercero responde -ERR locked y cierra la
+conexión. Si el servidor no fue iniciado con -a, responde -ERR auth required y
+no es posible ejecutar comandos protegidos.
+
+Comandos disponibles:
+
+    STATS
+
+Devuelve una línea con:
+
+    +OK conn-accepted=<n> conn-active=<n> conn-rejected=<n>
+        auth-fail=<n> origin-ok=<n> origin-fail=<n>
+        bytes-c2o=<n> bytes-o2c=<n> admin-sessions=<n>
+
+La respuesta real no contiene saltos intermedios; arriba se partió solo por
+legibilidad. conn-accepted es el total histórico de conexiones SOCKS admitidas,
+conn-active las actualmente abiertas y conn-rejected las rechazadas.
+auth-fail cuenta autenticaciones SOCKS fallidas. origin-ok/origin-fail describen
+el resultado de la salida, los campos bytes acumulan datos efectivamente
+enviados y admin-sessions indica sesiones administrativas activas.
+
+    USERS
+
+Responde +OK users=<lista-separada-por-comas> o +OK users=-. Las claves nunca se
+devuelven.
+
+    USER SET <nombre> <clave>
+
+Agrega un usuario o reemplaza su clave y responde +OK user set. El límite es de
+diez usuarios. Si está completo responde -ERR user limit reached.
+
+    USER DELETE <nombre>
+
+Elimina un usuario y responde +OK user deleted. Si no existe responde -ERR user
+not found.
+
+    CONFIG GET
+
+Responde:
+
+    +OK negotiation-timeout=<n> connect-timeout=<n>
+        idle-timeout=<n> max-connections=<n>
+
+    CONFIG SET <clave> <valor>
+
+Acepta las claves negotiation-timeout, connect-timeout, idle-timeout y
+max-connections. Los valores son enteros entre 0 y 2147483647. Los timeouts se
+expresan en segundos. Cero deshabilita cada timeout; max-connections=0 elimina
+el límite configurable. Un cambio correcto responde +OK config set y permanece
+vigente hasta que el proceso termina.
+
+    QUIT
+
+No requiere autenticación. Responde +OK bye y cierra la conexión.
+
+Los errores de sintaxis incluyen mensajes usage específicos. Los comandos o
+subcomandos desconocidos responden -ERR unknown command, -ERR unknown USER
+command o -ERR unknown CONFIG command. La especificación completa, incluidos
+límites y respuestas exactas, se encuentra en docs/management-protocol.md.
+
+2.3. Cliente administrativo
+----------------------------
+
+bin/client es una utilidad de terminal con I/O bloqueante, permitida por la
+consigna para este componente. Se conecta al listener administrativo, envía
+AUTH cuando se proporciona -a, ejecuta un comando, imprime la respuesta y
+termina con código cero ante +OK o distinto de cero ante -ERR.
+
+Expone comandos cómodos como:
+
+    client -a secreto stats
+    client -a secreto user set pablito clave
+    client -a secreto config set idle-timeout 60
+
+2.4. Métricas
+--------------
+
+Las métricas son volátiles y viven en memoria. Se actualizan en el event loop,
+sin necesidad de locks. Se registran conexiones aceptadas, activas y rechazadas;
+autenticaciones SOCKS fallidas; salidas exitosas/fallidas; bytes por dirección y
+sesiones administrativas activas.
+
+2.5. Registro de accesos
+------------------------
+
+El access log se abre una vez en modo append. Sin -o se escribe a stderr. Cada
+línea es TSV con esta forma:
+
+    timestamp  usuario  destino:puerto  bytes_c2o  bytes_o2c  evento
+
+OPEN marca un túnel establecido y usa guiones en los campos de bytes. CLOSE
+marca el fin de un túnel abierto e incluye sus contadores. FAIL: <motivo> marca
+un fallo anterior a la apertura. Los timestamps están en UTC con formato ISO
+8601. Un usuario no autenticado se representa con -.
+
+2.6. Apagado ordenado
+---------------------
+
+SIGINT y SIGTERM solicitan graceful shutdown. Al recibir la primera señal, el
+servidor desregistra y cierra ambos listeners y espera que terminen las sesiones
+SOCKS y administrativas existentes. Una segunda señal fuerza la salida. Al
+finalizar se detiene el worker DNS y se liberan selector, pools, usuarios,
+métricas y archivo de log.
+
+
+3. Problemas encontrados durante el diseño y la implementación
+================================================================
+
+3.1. Mensajes fragmentados y coalescidos
+-----------------------------------------
+
+TCP no preserva límites de mensajes. HELLO, AUTH y REQUEST pueden recibirse en
+varios recv o juntos en uno solo. Se conservaron los bytes no consumidos en un
+buffer común y se agregó un bombeo de estados que procesa inmediatamente el
+mensaje siguiente. El protocolo administrativo recibió un tratamiento análogo:
+conserva los bytes posteriores a la primera línea hasta enviar su respuesta.
+
+3.2. Resolución DNS fuera del event loop
+----------------------------------------
+
+getaddrinfo puede bloquear y la consigna solo permite threads para esa función.
+Se creó un worker con cola y notificación al selector. Durante la integración se
+detectó que una sesión podía terminar mientras el worker retenía un puntero a
+ella. Se resolvió con un contador de referencias que mantiene viva la estructura
+hasta recibir el resultado.
+
+3.3. Reintentos sobre múltiples direcciones
+--------------------------------------------
+
+Un FQDN puede devolver varias direcciones y la primera no necesariamente está
+disponible. El estado CONNECTING conserva el nodo siguiente de addrinfo y, ante
+SO_ERROR, cierra el descriptor fallido e intenta el siguiente antes de contestar
+al cliente.
+
+3.4. Relay, backpressure y half-close
+-------------------------------------
+
+La dificultad principal fue coordinar dos flujos parciales sin bloquear ni
+crecer memoria. Los intereses OP_READ/OP_WRITE se recalculan después de cada
+operación. Un EOF no puede cerrar inmediatamente ambos sockets porque todavía
+puede haber bytes en tránsito; se drena el buffer y recién entonces se propaga
+el half-close.
+
+3.5. Lifecycle, métricas y access log
+-------------------------------------
+
+Durante la integración aparecieron cierres contabilizados dos veces y sesiones
+abiertas clasificadas como FAIL ante un final no prolijo. La emisión del log se
+centralizó en el lifecycle: toda sesión que alcanzó COPY genera OPEN y luego
+CLOSE; si no lo alcanzó genera FAIL. Los contadores de cierre se actualizan una
+única vez.
+
+3.6. Timeouts y límite de conexiones
+-------------------------------------
+
+Los valores de configuración inicialmente solo se almacenaban. Se agregó un
+barrido periódico de sesiones para aplicar negociación, conexión e inactividad,
+y el accept valida el máximo configurable antes de admitir una nueva sesión.
+
+3.7. Stress de 500 conexiones
+------------------------------
+
+El backlog inicial era 20, por lo que las ráfagas concurrentes perdían SYNs y
+los clientes reintentaban con backoff. Se aumentó a 1024. También se detectó que
+un fallo al registrar el descriptor de origen podía dejar la sesión esperando
+un evento inexistente; ahora el fallo se transforma en respuesta general en vez
+de colgar la conexión.
+
+
+4. Limitaciones de la aplicación
+=================================
+
+4.1. Límite de select y descriptores
+------------------------------------
+
+El selector docente utiliza select(2), con FD_SETSIZE=1024. Cada túnel requiere
+dos descriptores, además de listeners y mecanismos internos. El techo práctico
+observado es de aproximadamente 510–512 túneles simultáneos. Además, select
+escanea el conjunto con costo O(n), por lo que no es una base adecuada para
+escalar mucho más allá del requisito de 500.
+
+4.2. Robustez de la negociación no bloqueante
+----------------------------------------------
+
+HELLO, AUTH, REQUEST y el servicio administrativo manejan mensajes y escrituras
+parciales, pero algunos recv/send previos al relay clasifican EAGAIN,
+EWOULDBLOCK o EINTR como error de sesión. El relay sí trata esos resultados de
+forma explícita. Es una limitación conocida de esta versión.
+
+4.3. Worker DNS único
+---------------------
+
+Existe un solo worker y las consultas se procesan en orden. Una resolución lenta
+puede demorar las siguientes. El timeout de negociación no cancela una consulta
+DNS ya iniciada y no existe cache.
+
+4.4. Estado volátil
+-------------------
+
+Usuarios agregados por management, configuración dinámica y métricas se pierden
+al reiniciar. Solo el access log persiste cuando apunta a un archivo.
+
+4.5. Seguridad administrativa
+------------------------------
+
+El protocolo no cifra el secreto ni las credenciales. El listener se limita a
+loopback por defecto, pero si se publica en otra interfaz debe protegerse con
+firewall y un canal cifrado externo.
+
+4.6. Plataforma
+---------------
+
+La plataforma soportada para entrega y stress es Linux. El fixture de stress
+usa pthread_barrier_t y no compila sin cambios en macOS. Las pruebas unitarias
+dependen de Check y Subunit.
+
+4.7. Funcionalidad fuera de alcance
+-----------------------------------
+
+No se implementan BIND, UDP ASSOCIATE ni GSSAPI. La inspección POP3 y captura de
+credenciales corresponden exclusivamente a una segunda entrega.
+
+
+5. Posibles extensiones
+=======================
+
+- Reemplazar select por epoll o poll para superar FD_SETSIZE y reducir el costo
+  de recorrer descriptores.
+- Normalizar EAGAIN, EWOULDBLOCK y EINTR en todos los estados de negociación y
+  administración.
+- Incorporar un pool de workers DNS, cache con TTL y cancelación de consultas.
+- Persistir usuarios y configuración con escritura atómica y carga inicial.
+- Proteger el protocolo administrativo mediante TLS o autenticación con desafío
+  en vez de enviar un secreto reutilizable.
+- Agregar rotación y formato configurable del access log.
+- Exportar métricas a un formato estándar de observabilidad.
+- Hacer portable el stress reemplazando pthread_barrier_t por una barrera basada
+  en mutex y condición.
+- Implementar UDP ASSOCIATE y BIND como extensiones del proxy.
+- Para una eventual segunda entrega, incorporar inspección POP3 según la nueva
+  consigna sin mezclarla con el relay base.
+
+
+6. Conclusiones
+===============
+
+El proyecto integra negociación SOCKS5, autenticación, conexión robusta a
+múltiples direcciones, relay bidireccional, administración en línea, métricas,
+auditoría y apagado ordenado dentro de un único event loop de red. El diseño con
+buffers acotados evita cargar flujos completos en memoria y cubre las
+fragmentaciones propias de TCP.
+
+La prueba de 500 túneles confirma el objetivo mínimo de concurrencia. A la vez,
+el ejercicio hizo visible el límite concreto de select/FD_SETSIZE: el requisito
+se cumple con poco margen y un backend más moderno sería la primera mejora para
+un uso de producción.
+
+La separación entre parsing, estado de sesión, DNS, métricas, usuarios,
+configuración y administración permitió probar los componentes en forma aislada
+y localizar problemas de integración. Las limitaciones detalladas en la sección
+4 delimitan con precisión el alcance de la versión entregada.
+
+
+7. Ejemplos de prueba
+=====================
+
+Los siguientes casos presuponen el servidor iniciado con:
+
+    ./bin/socks5d -u pablito:1234 -a secreto-admin \
+      -p 1080 -P 8080 -m 500 -t 30 -c 15 -i 300 \
+      -o /tmp/socks5-access.log
+
+7.1. Build y suites
+-------------------
+
+    make clean
+    make
+    make test
+    make clean && make sanitize
+    make clean && STRESS_N=500 make stress
+
+En el stress registrado sobre Linux se obtuvieron 500/500 túneles exitosos,
+repartidos entre IPv4, IPv6 y FQDN. La apertura promedio fue de 37–46 ms, el
+máximo de 76–96 ms y el tiempo total cercano a 0,1 s. La variación depende del
+host y su carga.
+
+7.2. CONNECT IPv4
+-----------------
+
+    curl --proxy socks5://127.0.0.1:1080 \
+      --proxy-user pablito:1234 http://127.0.0.1:8000/
+
+Resultado esperado: respuesta del servidor HTTP de destino y eventos OPEN/CLOSE
+en el access log.
+
+7.3. CONNECT por FQDN resuelto en el proxy
+------------------------------------------
+
+    curl --proxy socks5h://127.0.0.1:1080 \
+      --proxy-user pablito:1234 http://example.com/
+
+Resultado esperado: resolución a cargo del worker, conexión a alguna dirección
+disponible y transferencia bidireccional.
+
+7.4. Autenticación SOCKS incorrecta
+-----------------------------------
+
+    curl --proxy socks5h://127.0.0.1:1080 \
+      --proxy-user pablito:incorrecta http://example.com/
+
+Resultado esperado: rechazo RFC 1929 e incremento de auth-fail.
+
+7.5. Origen rechazado
+---------------------
+
+    curl --proxy socks5://127.0.0.1:1080 \
+      --proxy-user pablito:1234 http://127.0.0.1:9/
+
+Resultado esperado: respuesta connection refused cuando corresponda, incremento
+de origin-fail y evento FAIL.
+
+7.6. Administración
+-------------------
+
+    ./bin/client -a secreto-admin stats
+    ./bin/client -a secreto-admin users
+    ./bin/client -a secreto-admin user set invitado clave123
+    ./bin/client -a secreto-admin config set idle-timeout 60
+    ./bin/client -a secreto-admin config get
+    ./bin/client -a secreto-admin user delete invitado
+
+Resultado esperado: todas las respuestas comienzan con +OK y los cambios son
+visibles en consultas posteriores.
+
+7.7. Apagado ordenado
+---------------------
+
+Con un túnel activo:
+
+    kill -TERM <pid-de-socks5d>
+
+Resultado esperado: los listeners dejan de aceptar conexiones, el túnel activo
+puede drenar y el proceso termina cuando no quedan sesiones. Una segunda señal
+fuerza la salida.
+
+
+8. Guía de instalación detallada y precisa
+===========================================
+
+8.1. Plataforma
+---------------
+
+Se requiere Linux con compilador C11, GNU Make, pthread, sockets IPv4/IPv6 y
+headers POSIX. Para pruebas se necesitan Check y Subunit.
+
+En Debian/Ubuntu:
+
+    sudo apt update
+    sudo apt install build-essential check libsubunit-dev curl valgrind
+
+8.2. Obtención del proyecto
+---------------------------
+
+Clonar el repositorio de entrega y entrar en su raíz:
+
+    git clone <URL_DEL_REPOSITORIO>
+    cd TPE-Protos-G4
+
+No se requieren submódulos ni descargas de dependencias en tiempo de build del
+repositorio público.
+
+8.3. Compilación
+----------------
+
+    make clean
+    make
+
+El compilador usa C11 y activa -Wall, -Wextra, -Wpedantic y -Werror. Los
+artefactos resultantes son:
+
+    bin/socks5d
+    bin/client
+
+Los objetos intermedios quedan bajo obj/. Para eliminar todo lo generado:
+
+    make clean
+
+8.4. Verificación
+-----------------
+
+    make test
+    make clean && make sanitize
+    make clean && make stress
+
+make test compila y ejecuta las suites. make sanitize compila los binarios con
+AddressSanitizer y UndefinedBehaviorSanitizer; luego deben ejecutarse escenarios
+reales con esos binarios. make stress levanta y elimina automáticamente sus
+procesos auxiliares y usa 500 túneles por defecto.
+
+
+9. Instrucciones para la configuración
+=======================================
+
+9.1. Configuración inicial
+--------------------------
+
+El servidor se configura mediante opciones:
+
+    -l <dirección>   listener SOCKS, default 0.0.0.0
+    -p <puerto>      puerto SOCKS, default 1080
+    -L <dirección>   listener administrativo, default 127.0.0.1
+    -P <puerto>      puerto administrativo, default 8080
+    -u <user>:<pass> usuario SOCKS, repetible hasta 10
+    -a <secreto>     autenticación administrativa
+    -m <cantidad>    máximo de conexiones; 0 sin límite configurable
+    -t <segundos>    timeout de negociación; 0 deshabilitado
+    -c <segundos>    timeout de conexión; 0 deshabilitado
+    -i <segundos>    timeout idle; 0 deshabilitado
+    -o <archivo>     access log; default stderr
+    -h               ayuda
+    -v               versión
+
+Las direcciones de listeners deben ser numéricas. Configurar al menos un -u
+activa la exigencia de RFC 1929. Configurar -a es necesario para utilizar los
+comandos protegidos de administración.
+
+9.2. Configuración dinámica
+---------------------------
+
+Las claves modificables sin reiniciar son negotiation-timeout,
+connect-timeout, idle-timeout y max-connections. Se consultan con CONFIG GET y
+se cambian con CONFIG SET. Los cambios son volátiles.
+
+El nuevo negotiation-timeout se toma al crear sesiones posteriores. El
+connect-timeout se fija al comenzar una conexión a origen. El idle-timeout se
+consulta durante el barrido y puede afectar túneles ya abiertos. El máximo de
+conexiones se aplica en los accepts siguientes.
+
+
+10. Ejemplos de configuración y monitoreo
+=========================================
+
+10.1. Desarrollo local sin usuarios SOCKS
+------------------------------------------
+
+    ./bin/socks5d -a admin-local -p 1080 -P 8080
+
+El proxy acepta el método sin autenticación. El servicio administrativo sigue
+requiriendo admin-local.
+
+10.2. Servidor autenticado y auditado
+-------------------------------------
+
+    ./bin/socks5d \
+      -u ana:clave-a -u beto:clave-b \
+      -a secreto-largo \
+      -l 0.0.0.0 -p 1080 \
+      -L 127.0.0.1 -P 8080 \
+      -m 500 -t 30 -c 10 -i 300 \
+      -o /var/log/socks5-access.log
+
+El archivo debe poder ser abierto por el usuario que ejecuta socks5d.
+
+10.3. Monitoreo periódico
+-------------------------
+
+    ./bin/client -a secreto-largo stats
+    ./bin/client -a secreto-largo users
+
+10.4. Administración de usuarios
+---------------------------------
+
+    ./bin/client -a secreto-largo user set carla nueva-clave
+    ./bin/client -a secreto-largo user delete beto
+
+10.5. Ajuste en caliente
+------------------------
+
+    ./bin/client -a secreto-largo config get
+    ./bin/client -a secreto-largo config set connect-timeout 20
+    ./bin/client -a secreto-largo config set max-connections 450
+
+10.6. Lectura del access log
+----------------------------
+
+    tail -f /var/log/socks5-access.log
+
+Ejemplo de eventos:
+
+    2026-07-12T21:52:39Z\tana\texample.com:80\t-\t-\tOPEN
+    2026-07-12T21:52:40Z\tana\texample.com:80\t78\t1474\tCLOSE
+    2026-07-12T21:53:01Z\tbeto\t127.0.0.1:9\t-\t-\tFAIL: connect failed
+
+
+11. Documento de diseño del proyecto
+=====================================
+
+11.1. Arquitectura general
+---------------------------
+
+main.c crea usuarios, métricas, configuración, access log, selector y worker
+DNS. Los listeners SOCKS y administrativo se registran en el mismo selector. El
+thread principal ejecuta selector_select y el barrido de timeouts. Solo el
+worker DNS es adicional y solo realiza getaddrinfo y la notificación de regreso.
+
+Los módulos se distribuyen de la siguiente manera:
+
+- server/main.c: configuración inicial, listeners, señales y lifecycle global.
+- server/mng.c: sesiones y comandos administrativos.
+- shared/socks5.c: lifecycle SOCKS, STM, conexión y relay.
+- shared/hello.c, auth.c y request.c: parsers de protocolo.
+- shared/dns_worker.c: cola y resolución bloqueante aislada.
+- shared/users.c, metrics.c, config.c y access_log.c: estado compartido.
+- shared/selector.c y stm.c: infraestructura docente adaptada.
+- client/main.c: cliente administrativo bloqueante.
+
+11.2. Estado por sesión
+-----------------------
+
+Cada sesión SOCKS mantiene descriptor de cliente y origen, dirección del peer,
+dos buffers, STM, datos específicos del estado, referencias, deadlines, usuario
+autenticado, destino y estado del log. Una lista doble permite recorrer las
+sesiones activas para aplicar timeouts. Un pool de hasta 50 estructuras evita
+alocaciones repetidas.
+
+La STM sigue:
+
+    HELLO_READ -> HELLO_WRITE -> [AUTH_READ -> AUTH_WRITE] -> REQUEST_READ
+    REQUEST_READ -> [REQUEST_RESOLV] -> CONNECTING -> REQUEST_WRITE
+    REQUEST_WRITE -> COPY -> DONE/ERROR
+
+11.3. Flujo de datos
+--------------------
+
+En la negociación, un buffer común retiene bytes no consumidos y permite pasar
+al parser siguiente cuando TCP coalesce mensajes. En COPY, el buffer read lleva
+cliente-a-origen y write lleva origen-a-cliente. Los intereses se desactivan
+cuando un buffer se llena y se reactivan al drenarlo.
+
+11.4. Sincronización
+--------------------
+
+Usuarios, configuración, métricas y access log se usan exclusivamente en el
+event loop. El worker DNS comparte únicamente el target del resultado y el
+mecanismo de notificación protegido por la infraestructura del selector. El
+contador de referencias impide liberar una sesión mientras el worker conserva
+su resultado asociado.
+
+11.5. Fallos y limpieza
+-----------------------
+
+Los parsers transforman errores de protocolo en estados terminales o respuestas
+SOCKS específicas. Los fallos de conexión recorren candidatos. Todo final pasa
+por el lifecycle central, que registra, actualiza métricas, desregistra y cierra
+descriptores. La limpieza global une el worker antes de destruir el selector.
+
+11.6. Decisiones y tradeoffs
+----------------------------
+
+- select fue conservado por provenir del scaffold docente y cumplir 500
+  conexiones, aunque deja un techo inmediato.
+- Se usan buffers fijos para backpressure y consumo de memoria predecible.
+- DNS se serializa en un worker para respetar la restricción de threads y
+  mantener simple el event loop.
+- El protocolo administrativo es texto de una línea para facilitar diagnóstico
+  y cliente, a cambio de no admitir espacios ni estructuras complejas.
+- La configuración y métricas son volátiles porque la consigna lo permite y así
+  no se incorpora I/O bloqueante de persistencia al loop.
+
+Para diagramas y explicación ampliada, véase docs/design.md.
