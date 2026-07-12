@@ -119,7 +119,7 @@ struct socks5 {
 
 static struct socks5 *socks5_new(int client_fd);
 static void socks5_destroy(struct socks5 *s);
-static void socksv5_done(struct selector_key *key, bool clean_close);
+static void socksv5_done(struct selector_key *key);
 static void socksv5_read(struct selector_key *key);
 static void socksv5_write(struct selector_key *key);
 static void socksv5_block(struct selector_key *key);
@@ -142,13 +142,13 @@ socks5_log_user(struct socks5 *s)
 }
 
 static void
-socks5_log_event(struct socks5 *s, bool clean_close)
+socks5_log_event(struct socks5 *s)
 {
     if (g_access_log == NULL || s->log_emitted || !s->destination_set) {
         return;
     }
 
-    if (s->tunnel_opened && clean_close) {
+    if (s->tunnel_opened) { /* CLOSE with real byte counts even on a non-clean end */
         access_log_close(g_access_log, socks5_log_user(s), s->destination,
                          s->destination_port, s->client.copy.transferred,
                          s->orig.copy.transferred);
@@ -245,13 +245,15 @@ static unsigned hello_read(struct selector_key *key) {
     bool error = false;
     unsigned next_state = HELLO_READ;
 
-    size_t available;
-    uint8_t *write_ptr = buffer_write_ptr(hello->rb, &available);
-    ssize_t received = recv(key->fd, write_ptr, available, 0);
-    if (received <= 0) {
-        return ERROR;
+    if (!buffer_can_read(hello->rb)) {
+        size_t available;
+        uint8_t *write_ptr = buffer_write_ptr(hello->rb, &available);
+        ssize_t received = recv(key->fd, write_ptr, available, 0);
+        if (received <= 0) {
+            return ERROR;
+        }
+        buffer_write_adv(hello->rb, received);
     }
-    buffer_write_adv(hello->rb, received);
 
     enum hello_state state = hello_consume(hello->rb, &hello->parser, &error);
     if (error) {
@@ -333,13 +335,15 @@ static unsigned auth_read(struct selector_key *key) {
     struct auth_st *auth = &ATTACHMENT(key)->client.auth;
     unsigned next_state = AUTH_READ;
 
-    size_t available;
-    uint8_t *write_ptr = buffer_write_ptr(auth->rb, &available);
-    ssize_t received = recv(key->fd, write_ptr, available, 0);
-    if (received <= 0) {
-        return ERROR;
+    if (!buffer_can_read(auth->rb)) {
+        size_t available;
+        uint8_t *write_ptr = buffer_write_ptr(auth->rb, &available);
+        ssize_t received = recv(key->fd, write_ptr, available, 0);
+        if (received <= 0) {
+            return ERROR;
+        }
+        buffer_write_adv(auth->rb, received);
     }
-    buffer_write_adv(auth->rb, received);
 
     bool error = false;
     enum auth_state state = auth_consume(auth->rb, &auth->parser, &error);
@@ -429,6 +433,7 @@ static unsigned request_process(struct selector_key *key) {
             }
             return REQUEST_WRITE;
         }
+        s->references++; /* the DNS worker holds a pointer into this session */
         return REQUEST_RESOLV;
     }
     return CONNECTING;
@@ -437,6 +442,8 @@ static unsigned request_process(struct selector_key *key) {
 static unsigned request_resolv_done(struct selector_key *key) {
     struct socks5 *s = ATTACHMENT(key);
     struct request_st *req = &s->client.request;
+
+    s->references--; /* release the DNS worker's reference */
 
     if (s->origin_resolution == NULL) {
         socks5_set_failure(s, "dns resolution failed");
@@ -457,13 +464,15 @@ static unsigned request_read(struct selector_key *key) {
     struct request_st *req = &ATTACHMENT(key)->client.request;
     bool error = false;
 
-    size_t available;
-    uint8_t *write_ptr = buffer_write_ptr(req->rb, &available);
-    ssize_t received = recv(key->fd, write_ptr, available, 0);
-    if (received <= 0) {
-        return ERROR;
+    if (!buffer_can_read(req->rb)) {
+        size_t available;
+        uint8_t *write_ptr = buffer_write_ptr(req->rb, &available);
+        ssize_t received = recv(key->fd, write_ptr, available, 0);
+        if (received <= 0) {
+            return ERROR;
+        }
+        buffer_write_adv(req->rb, received);
     }
-    buffer_write_adv(req->rb, received);
 
     enum request_state st = request_consume(req->rb, &req->parser, &error);
     if (error) {
@@ -960,9 +969,16 @@ socksv5_pool_destroy(void) {
 }
 
 static void
-socksv5_done(struct selector_key* key, bool clean_close) {
+socksv5_done(struct selector_key* key) {
     struct socks5 *s = ATTACHMENT(key);
-    socks5_log_event(s, clean_close);
+    socks5_log_event(s);
+
+    if (g_active_sessions > 0) {
+        g_active_sessions--;
+    }
+    if (g_metrics != NULL) {
+        metrics_conn_closed(g_metrics);
+    }
 
     const int fds[] = {
         s->client_fd,
@@ -978,29 +994,44 @@ socksv5_done(struct selector_key* key, bool clean_close) {
     }
 }
 
+/* Processes any already-buffered bytes left over from a coalesced recv(). */
+static enum socks_v5state
+socksv5_drain_pending(struct selector_key *key, enum socks_v5state st) {
+    struct socks5 *s = ATTACHMENT(key);
+    struct state_machine *stm = &s->stm;
+
+    while ((st == HELLO_READ || st == AUTH_READ || st == REQUEST_READ)
+           && buffer_can_read(&s->read_buffer)) {
+        st = stm_handler_read(stm, key);
+    }
+    return st;
+}
+
 static void
 socksv5_read(struct selector_key *key) {
     struct state_machine *stm = &ATTACHMENT(key)->stm;
-    const enum socks_v5state st =stm_handler_read(stm, key);
+    enum socks_v5state st = stm_handler_read(stm, key);
+    st = socksv5_drain_pending(key, st);
 
     if(st == ERROR || st == DONE) {
         if (st == ERROR) {
             socks5_set_failure(ATTACHMENT(key), "read error");
         }
-        socksv5_done(key, st == DONE);
+        socksv5_done(key);
     }
 }
 
 static void
 socksv5_write(struct selector_key *key) {
     struct state_machine *stm = &ATTACHMENT(key)->stm;
-    const enum socks_v5state st = stm_handler_write(stm, key);
+    enum socks_v5state st = stm_handler_write(stm, key);
+    st = socksv5_drain_pending(key, st);
 
     if(st == ERROR || st == DONE) {
         if (st == ERROR) {
             socks5_set_failure(ATTACHMENT(key), "write error");
         }
-        socksv5_done(key, st == DONE);
+        socksv5_done(key);
     }
 }
 
@@ -1013,19 +1044,13 @@ socksv5_block(struct selector_key *key) {
         if (st == ERROR) {
             socks5_set_failure(ATTACHMENT(key), "block error");
         }
-        socksv5_done(key, st == DONE);
+        socksv5_done(key);
     }
 }
 
 static void
 socksv5_close(struct selector_key *key) {
     struct socks5 * s=ATTACHMENT(key);
-    if (g_active_sessions > 0) {
-        g_active_sessions--;
-    }
-    if (g_metrics != NULL) {
-        metrics_conn_closed(g_metrics);
-    }
     socks5_destroy(s);
 }
 

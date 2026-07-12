@@ -20,6 +20,9 @@ struct mng_session {
     int fd;
     char line[MNG_LINE_SIZE];
     size_t line_len;
+    char in_buf[256];
+    size_t in_len;
+    size_t in_pos;
     char out[MNG_WRITE_SIZE];
     size_t out_len;
     size_t out_sent;
@@ -386,20 +389,14 @@ mng_passive_accept(struct selector_key *key)
     }
 }
 
+/* Drains in_buf; stops if a response is queued, resuming from in_pos later. */
 static void
-mng_read(struct selector_key *key)
+mng_process_input(struct selector_key *key)
 {
     struct mng_session *session = key->data;
-    char buf[256];
-    ssize_t n = recv(key->fd, buf, sizeof(buf), 0);
 
-    if (n <= 0) {
-        selector_unregister_fd(key->s, key->fd);
-        return;
-    }
-
-    for (ssize_t i = 0; i < n && session->out_len == 0; i++) {
-        char c = buf[i];
+    while (session->in_pos < session->in_len && session->out_len == 0) {
+        char c = session->in_buf[session->in_pos++];
         if (c == '\r') {
             continue;
         }
@@ -414,6 +411,28 @@ mng_read(struct selector_key *key)
             session->line[session->line_len++] = c;
         }
     }
+    if (session->in_pos >= session->in_len) {
+        session->in_pos = 0;
+        session->in_len = 0;
+    }
+}
+
+static void
+mng_read(struct selector_key *key)
+{
+    struct mng_session *session = key->data;
+
+    if (session->in_pos >= session->in_len) {
+        ssize_t n = recv(key->fd, session->in_buf, sizeof(session->in_buf), 0);
+        if (n <= 0) {
+            selector_unregister_fd(key->s, key->fd);
+            return;
+        }
+        session->in_len = (size_t)n;
+        session->in_pos = 0;
+    }
+
+    mng_process_input(key);
 }
 
 static void
@@ -439,7 +458,10 @@ mng_write(struct selector_key *key)
         session->out_sent = 0;
         if (session->closing) {
             selector_unregister_fd(key->s, key->fd);
-        } else {
+            return;
+        }
+        mng_process_input(key);
+        if (session->out_len == 0) {
             selector_set_interest_key(key, OP_READ);
         }
     }
