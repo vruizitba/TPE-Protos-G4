@@ -1060,15 +1060,27 @@ socksv5_done(struct selector_key* key) {
     }
 }
 
-/* Processes any already-buffered bytes left over from a coalesced recv(). */
+/* Drains buffered reads and sends replies immediately instead of waiting
+ * for the next select() round; falls back to OP_WRITE only on a partial send. */
 static enum socks_v5state
-socksv5_drain_pending(struct selector_key *key, enum socks_v5state st) {
+socksv5_pump(struct selector_key *key, enum socks_v5state st) {
     struct socks5 *s = ATTACHMENT(key);
     struct state_machine *stm = &s->stm;
+    struct selector_key wkey = { .s = key->s, .fd = s->client_fd, .data = s };
 
-    while ((st == HELLO_READ || st == AUTH_READ || st == REQUEST_READ)
-           && buffer_can_read(&s->read_buffer)) {
-        st = stm_handler_read(stm, key);
+    while (1) {
+        if ((st == HELLO_READ || st == AUTH_READ || st == REQUEST_READ)
+            && buffer_can_read(&s->read_buffer)) {
+            st = stm_handler_read(stm, key);
+        } else if (st == HELLO_WRITE || st == AUTH_WRITE || st == REQUEST_WRITE) {
+            unsigned next = stm_handler_write(stm, &wkey);
+            if (next == (unsigned)st) {
+                break; /* partial send: wait for the next OP_WRITE event */
+            }
+            st = (enum socks_v5state)next;
+        } else {
+            break;
+        }
     }
     return st;
 }
@@ -1077,7 +1089,7 @@ static void
 socksv5_read(struct selector_key *key) {
     struct state_machine *stm = &ATTACHMENT(key)->stm;
     enum socks_v5state st = stm_handler_read(stm, key);
-    st = socksv5_drain_pending(key, st);
+    st = socksv5_pump(key, st);
 
     if(st == ERROR || st == DONE) {
         if (st == ERROR) {
@@ -1091,7 +1103,7 @@ static void
 socksv5_write(struct selector_key *key) {
     struct state_machine *stm = &ATTACHMENT(key)->stm;
     enum socks_v5state st = stm_handler_write(stm, key);
-    st = socksv5_drain_pending(key, st);
+    st = socksv5_pump(key, st);
 
     if(st == ERROR || st == DONE) {
         if (st == ERROR) {
