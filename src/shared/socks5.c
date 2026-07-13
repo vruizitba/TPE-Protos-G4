@@ -1139,6 +1139,16 @@ static const struct fd_handler socks5_handler = {
     .handle_block  = socksv5_block,
 };
 
+static void
+active_list_add(struct socks5 *s) {
+    s->active_prev = NULL;
+    s->active_next = g_active_head;
+    if (g_active_head != NULL) {
+        g_active_head->active_prev = s;
+    }
+    g_active_head = s;
+}
+
 void
 socksv5_passive_accept(struct selector_key *key) {
     struct sockaddr_storage       client_addr;
@@ -1176,6 +1186,7 @@ socksv5_passive_accept(struct selector_key *key) {
         goto fail;
     }
     g_active_sessions++;
+    active_list_add(state);
     if (g_metrics != NULL) {
         metrics_conn_accepted(g_metrics);
     }
@@ -1265,13 +1276,6 @@ socks5_new(int client_fd) {
     s->negotiation_deadline = (g_config != NULL && g_config->negotiation_timeout > 0)
         ? now + g_config->negotiation_timeout : 0;
     s->connect_deadline = 0;
-
-    s->active_prev = NULL;
-    s->active_next = g_active_head;
-    if (g_active_head != NULL) {
-        g_active_head->active_prev = s;
-    }
-    g_active_head = s;
 
     return s;
 }

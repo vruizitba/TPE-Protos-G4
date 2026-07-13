@@ -444,6 +444,9 @@ mng_write(struct selector_key *key)
         ssize_t n = send(key->fd, session->out + session->out_sent,
                          session->out_len - session->out_sent, 0);
         if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return; /* socket buffer full: resume on the next OP_WRITE */
+            }
             selector_unregister_fd(key->s, key->fd);
             return;
         }
