@@ -424,7 +424,14 @@ mng_read(struct selector_key *key)
 
     if (session->in_pos >= session->in_len) {
         ssize_t n = recv(key->fd, session->in_buf, sizeof(session->in_buf), 0);
-        if (n <= 0) {
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return;
+            }
+            selector_unregister_fd(key->s, key->fd);
+            return;
+        }
+        if (n == 0) {
             selector_unregister_fd(key->s, key->fd);
             return;
         }

@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -198,9 +199,8 @@ socks5_store_destination(struct socks5 *s, const struct socks5_request *request)
     const char *stored = NULL;
 
     if (request->dest_addr.type == SOCKS_ATYP_FQDN) {
-        strncpy(s->destination, request->dest_addr.fqdn,
-                sizeof(s->destination) - 1);
-        s->destination[sizeof(s->destination) - 1] = '\0';
+        snprintf(s->destination, sizeof(s->destination), "%s",
+                 request->dest_addr.fqdn);
         stored = s->destination;
     } else if (request->dest_addr.type == SOCKS_ATYP_IPV4) {
         stored = inet_ntop(AF_INET, &request->dest_addr.ipv4,
@@ -265,7 +265,13 @@ static unsigned hello_read(struct selector_key *key) {
         size_t available;
         uint8_t *write_ptr = buffer_write_ptr(hello->rb, &available);
         ssize_t received = recv(key->fd, write_ptr, available, 0);
-        if (received <= 0) {
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return HELLO_READ;
+            }
+            return ERROR;
+        }
+        if (received == 0) {
             return ERROR;
         }
         buffer_write_adv(hello->rb, received);
@@ -290,7 +296,10 @@ static unsigned hello_write(struct selector_key *key) {
     size_t pending;
     uint8_t *read_ptr = buffer_read_ptr(hello->wb, &pending);
     ssize_t sent = send(key->fd, read_ptr, pending, 0);
-    if (sent <= 0) {
+    if (sent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return HELLO_WRITE;
+        }
         return ERROR;
     }
     buffer_read_adv(hello->wb, sent);
@@ -340,9 +349,8 @@ static unsigned auth_process(struct auth_st *auth, struct socks5 *session) {
     auth->status = 0x01;
     if (g_users == NULL || users_check(g_users, auth->parser.uname, auth->parser.passwd)) {
         auth->status = 0x00;
-        strncpy(session->authenticated_user, auth->parser.uname,
-                sizeof(session->authenticated_user) - 1);
-        session->authenticated_user[sizeof(session->authenticated_user) - 1] = '\0';
+        snprintf(session->authenticated_user, sizeof(session->authenticated_user),
+                 "%s", auth->parser.uname);
     } else {
         if (g_metrics != NULL) {
             metrics_auth_fail(g_metrics);
@@ -362,7 +370,13 @@ static unsigned auth_read(struct selector_key *key) {
         size_t available;
         uint8_t *write_ptr = buffer_write_ptr(auth->rb, &available);
         ssize_t received = recv(key->fd, write_ptr, available, 0);
-        if (received <= 0) {
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return AUTH_READ;
+            }
+            return ERROR;
+        }
+        if (received == 0) {
             return ERROR;
         }
         buffer_write_adv(auth->rb, received);
@@ -388,7 +402,10 @@ static unsigned auth_write(struct selector_key *key) {
     size_t pending;
     uint8_t *read_ptr = buffer_read_ptr(auth->wb, &pending);
     ssize_t sent = send(key->fd, read_ptr, pending, 0);
-    if (sent <= 0) {
+    if (sent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return AUTH_WRITE;
+        }
         return ERROR;
     }
     buffer_read_adv(auth->wb, sent);
@@ -491,7 +508,13 @@ static unsigned request_read(struct selector_key *key) {
         size_t available;
         uint8_t *write_ptr = buffer_write_ptr(req->rb, &available);
         ssize_t received = recv(key->fd, write_ptr, available, 0);
-        if (received <= 0) {
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return REQUEST_READ;
+            }
+            return ERROR;
+        }
+        if (received == 0) {
             return ERROR;
         }
         buffer_write_adv(req->rb, received);
@@ -515,7 +538,10 @@ static unsigned request_write(struct selector_key *key) {
     size_t pending;
     uint8_t *read_ptr = buffer_read_ptr(req->wb, &pending);
     ssize_t sent = send(key->fd, read_ptr, pending, 0);
-    if (sent <= 0) {
+    if (sent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return REQUEST_WRITE;
+        }
         return ERROR;
     }
     buffer_read_adv(req->wb, sent);
