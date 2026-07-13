@@ -46,6 +46,8 @@ struct hello_st {
     buffer *rb, *wb;
     struct hello_parser parser;
     uint8_t method;
+    bool no_auth_offered;
+    bool user_pass_offered;
 };
 
 struct auth_st {
@@ -218,12 +220,11 @@ socks5_store_destination(struct socks5 *s, const struct socks5_request *request)
 }
 
 static void on_hello_method(struct hello_parser *parser, uint8_t method) {
-    uint8_t *selected = parser->data;
-    if (method == SOCKS_HELLO_USERNAME_PASSWORD) {
-        *selected = method;
-    } else if (method == SOCKS_HELLO_NOAUTHENTICATION_REQUIRED
-               && *selected == SOCKS_HELLO_NO_ACCEPTABLE_METHODS) {
-        *selected = method;
+    struct hello_st *hello = parser->data;
+    if (method == SOCKS_HELLO_NOAUTHENTICATION_REQUIRED) {
+        hello->no_auth_offered = true;
+    } else if (method == SOCKS_HELLO_USERNAME_PASSWORD) {
+        hello->user_pass_offered = true;
     }
 }
 
@@ -233,20 +234,23 @@ static void hello_read_init(const unsigned state, struct selector_key *key) {
     hello->rb = &ATTACHMENT(key)->read_buffer;
     hello->wb = &ATTACHMENT(key)->write_buffer;
     hello->method = SOCKS_HELLO_NO_ACCEPTABLE_METHODS;
-    hello->parser.data = &hello->method;
+    hello->no_auth_offered = false;
+    hello->user_pass_offered = false;
+    hello->parser.data = hello;
     hello->parser.on_authentication_method = on_hello_method;
     hello_parser_init(&hello->parser);
 }
 
 static unsigned hello_process(struct hello_st *hello) {
-    if (hello->method != SOCKS_HELLO_USERNAME_PASSWORD
-        && g_users != NULL && users_count(g_users) > 0) {
+    const bool auth_required = g_users != NULL && users_count(g_users) > 0;
+    if (auth_required && hello->user_pass_offered) {
+        hello->method = SOCKS_HELLO_USERNAME_PASSWORD;
+    } else if (!auth_required && hello->no_auth_offered) {
+        hello->method = SOCKS_HELLO_NOAUTHENTICATION_REQUIRED;
+    } else {
         hello->method = SOCKS_HELLO_NO_ACCEPTABLE_METHODS;
     }
     if (hello_marshall(hello->wb, hello->method) < 0) {
-        return ERROR;
-    }
-    if (hello->method == SOCKS_HELLO_NO_ACCEPTABLE_METHODS) {
         return ERROR;
     }
     return HELLO_WRITE;
@@ -292,6 +296,9 @@ static unsigned hello_write(struct selector_key *key) {
     buffer_read_adv(hello->wb, sent);
 
     if (!buffer_can_read(hello->wb)) {
+        if (hello->method == SOCKS_HELLO_NO_ACCEPTABLE_METHODS) {
+            return DONE;
+        }
         if (selector_set_interest_key(key, OP_READ) != SELECTOR_SUCCESS) {
             return ERROR;
         }
