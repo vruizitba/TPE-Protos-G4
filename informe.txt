@@ -250,6 +250,19 @@ Los valores de configuración inicialmente solo se almacenaban. Se agregó un
 barrido periódico de sesiones para aplicar negociación, conexión e inactividad,
 y el accept valida el máximo configurable antes de admitir una nueva sesión.
 
+Cada vencimiento produce una salida distinta según cuánto del protocolo SOCKS5
+se completó. El timeout de negociación y el de inactividad cierran la sesión sin
+respuesta: en negociación el pedido puede no estar siquiera parseado, y en COPY
+ya se relayan bytes crudos y no queda campo de protocolo donde señalizar. El
+timeout de conexión responde TTL expired, único punto donde el cliente ya envió
+un CONNECT completo y espera respuesta. El límite de conexiones cierra el socket
+inmediatamente tras el accept, antes de leer el HELLO. El estado REQUEST_RESOLV
+se excluye del barrido a propósito: el worker DNS conserva un puntero crudo a la
+sesión y cerrarla ahí reabriría el riesgo de reutilización de descriptor. Por
+último, como el barrido corre una vez por retorno de selector_select, un timeout
+menor a SELECTOR_TIMEOUT_SECS (10 s) puede demorar hasta ese valor en dispararse
+si no hay tráfico.
+
 3.7. Stress de 500 conexiones
 ------------------------------
 
@@ -272,42 +285,34 @@ observado es de aproximadamente 510–512 túneles simultáneos. Además, select
 escanea el conjunto con costo O(n), por lo que no es una base adecuada para
 escalar mucho más allá del requisito de 500.
 
-4.2. Robustez de la negociación no bloqueante
-----------------------------------------------
-
-HELLO, AUTH, REQUEST y el servicio administrativo manejan mensajes y escrituras
-parciales, pero algunos recv/send previos al relay clasifican EAGAIN,
-EWOULDBLOCK o EINTR como error de sesión. El relay sí trata esos resultados de
-forma explícita. Es una limitación conocida de esta versión.
-
-4.3. Worker DNS único
+4.2. Worker DNS único
 ---------------------
 
 Existe un solo worker y las consultas se procesan en orden. Una resolución lenta
 puede demorar las siguientes. El timeout de negociación no cancela una consulta
 DNS ya iniciada y no existe cache.
 
-4.4. Estado volátil
+4.3. Estado volátil
 -------------------
 
 Usuarios agregados por management, configuración dinámica y métricas se pierden
 al reiniciar. Solo el access log persiste cuando apunta a un archivo.
 
-4.5. Seguridad administrativa
+4.4. Seguridad administrativa
 ------------------------------
 
 El protocolo no cifra el secreto ni las credenciales. El listener se limita a
 loopback por defecto, pero si se publica en otra interfaz debe protegerse con
 firewall y un canal cifrado externo.
 
-4.6. Plataforma
+4.5. Plataforma
 ---------------
 
 La plataforma soportada para entrega y stress es Linux. El fixture de stress
 usa pthread_barrier_t y no compila sin cambios en macOS. Las pruebas unitarias
 dependen de Check y Subunit.
 
-4.7. Funcionalidad fuera de alcance
+4.6. Funcionalidad fuera de alcance
 -----------------------------------
 
 No se implementan BIND, UDP ASSOCIATE ni GSSAPI. La inspección POP3 y captura de
@@ -319,8 +324,6 @@ credenciales corresponden exclusivamente a una segunda entrega.
 
 - Reemplazar select por epoll o poll para superar FD_SETSIZE y reducir el costo
   de recorrer descriptores.
-- Normalizar EAGAIN, EWOULDBLOCK y EINTR en todos los estados de negociación y
-  administración.
 - Incorporar un pool de workers DNS, cache con TTL y cancelación de consultas.
 - Persistir usuarios y configuración con escritura atómica y carga inicial.
 - Proteger el protocolo administrativo mediante TLS o autenticación con desafío
@@ -362,6 +365,11 @@ Los siguientes casos presuponen el servidor iniciado con:
     ./bin/socks5d -u pablito:1234 -a secreto-admin \
       -p 1080 -P 8080 -m 500 -t 30 -c 15 -i 300 \
       -o /tmp/socks5-access.log
+
+Los ejemplos que apuntan a un origen HTTP en 127.0.0.1:8000 asumen un servidor
+de prueba escuchando en ese puerto, por ejemplo:
+
+    python3 -m http.server 8000
 
 7.1. Build y suites
 -------------------
@@ -454,13 +462,16 @@ En Debian/Ubuntu:
 8.2. Obtención del proyecto
 ---------------------------
 
-Clonar el repositorio de entrega y entrar en su raíz:
+La entrega es un tarball (o zip) que contiene el repositorio con su historia.
+Descomprimirlo y entrar en su raíz:
 
-    git clone <URL_DEL_REPOSITORIO>
+    tar xzf TPE-Protos-G4.tar.gz
     cd TPE-Protos-G4
 
-No se requieren submódulos ni descargas de dependencias en tiempo de build del
-repositorio público.
+El proyecto es autocontenido: el build no descarga nada de la red y no hay
+submódulos que inicializar. Las dependencias del sistema (sección 8.1) deben
+estar instaladas previamente. La historia del repositorio queda incluida en la
+carpeta .git del material entregado.
 
 8.3. Compilación
 ----------------
@@ -513,7 +524,8 @@ El servidor se configura mediante opciones:
     -h               ayuda
     -v               versión
 
-Las direcciones de listeners deben ser numéricas. Configurar al menos un -u
+Las direcciones de los listeners deben ser IP literales (por ejemplo 127.0.0.1
+o ::1), no nombres de host. Configurar al menos un -u
 activa la exigencia de RFC 1929. Configurar -a es necesario para utilizar los
 comandos protegidos de administración.
 
@@ -659,5 +671,15 @@ descriptores. La limpieza global une el worker antes de destruir el selector.
   y cliente, a cambio de no admitir espacios ni estructuras complejas.
 - La configuración y métricas son volátiles porque la consigna lo permite y así
   no se incorpora I/O bloqueante de persistencia al loop.
+- Se descartó el framework de parsing genérico basado en tablas provisto por la
+  cátedra en favor de parsers ad-hoc por etapa (hello, auth, request), cada uno
+  con su propio estado. El motor genérico quedó sin uso desde el inicio y se
+  eliminó para no arrastrar código muerto.
+- Se retiraron los dissectors y su flag asociado al decidir no encarar la segunda
+  entrega, evitando dejar cableada una inspección POP3 que no se implementa.
+- Los warnings del código docente adaptado se corrigieron en el propio código
+  (por ejemplo ajustando el tipo de una constante de comparación y marcando un
+  parámetro no usado) en lugar de silenciarlos con flags -Wno, una vez confirmado
+  que modificar esos archivos estaba permitido.
 
 Para diagramas y explicación ampliada, véase docs/design.md.

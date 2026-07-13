@@ -62,11 +62,17 @@ y alterna el interés del selector entre lectura y escritura.
 
 ### 3.1 Selección de método
 
-El parser de HELLO consume mensajes incluso cuando llegan fragmentados. Si el
-store contiene usuarios, el servidor solo acepta el método usuario/contraseña
-(`0x02`). Si no contiene usuarios, acepta sin autenticación (`0x00`). La
-selección prioriza `0x02` cuando el cliente lo ofrece; si el store está vacío, la
-subnegociación posterior no encontrará credenciales válidas.
+El parser de HELLO consume mensajes incluso cuando llegan fragmentados. La
+selección de método depende de si el store contiene usuarios:
+
+- Con usuarios configurados, el servidor exige usuario/contraseña: elige `0x02`
+  si el cliente lo ofrece, y responde `0xFF` (sin métodos aceptables) si no.
+- Sin usuarios, el servidor no requiere autenticación: elige `0x00` si el
+  cliente lo ofrece, y responde `0xFF` si el cliente solo ofrece `0x02`.
+
+Cuando el método elegido es `0xFF`, el servidor envía esa respuesta al cliente y
+recién entonces cierra la sesión. De este modo un cliente sin método en común
+recibe el rechazo del protocolo antes del cierre.
 
 Los bytes que pertenecen al siguiente mensaje y llegan en el mismo `recv` se
 conservan en el buffer. Una rutina de bombeo continúa el estado siguiente sin
@@ -97,6 +103,12 @@ sea reutilizada antes de recibir el resultado.
 
 Existe una única cola y un único worker. Esto evita incorporar sincronización en
 el event loop, a costa de serializar las resoluciones.
+
+Por esta misma referencia cruda, el barrido de timeouts nunca fuerza el cierre de
+una sesión en `REQUEST_RESOLV`. Mientras el worker conserva el puntero a la
+sesión, cerrar y reciclar su descriptor abriría una carrera de reutilización de
+fd que el contador de referencias no cubre por completo, de modo que ese estado
+queda deliberadamente excluido del deadline.
 
 ### 4.2 Conexión no bloqueante
 
@@ -209,11 +221,12 @@ costo de escanear el conjunto también es O(n). Reemplazar el backend por
 
 - La plataforma de entrega es Linux. El fixture de stress usa
   `pthread_barrier_t`, no implementado por macOS.
-- En HELLO, AUTH, REQUEST y management existen caminos donde `EAGAIN`,
-  `EWOULDBLOCK` o `EINTR` se clasifican como error. El relay sí los maneja de
-  forma explícita.
 - El worker DNS es único, no posee timeout propio y una consulta en curso no se
   cancela.
+- El barrido de timeouts corre una vez por retorno de `selector_select`. Sin
+  tráfico ese retorno ocurre como mucho cada `SELECTOR_TIMEOUT_SECS` (10 s), por
+  lo que un timeout configurado por debajo de ese valor puede dispararse con
+  hasta ~10 s de retraso.
 - Las credenciales y el protocolo administrativo viajan sin cifrado; por eso el
   listener administrativo se restringe a loopback por defecto.
 - La configuración, usuarios y métricas son volátiles.

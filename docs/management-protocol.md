@@ -249,12 +249,15 @@ Argumentos adicionales producen `-ERR usage CONFIG GET`.
 CONFIG SP SET SP clave SP UINT
 ```
 
-Las claves válidas son:
+Las claves válidas y sus unidades son:
 
-- `negotiation-timeout`
-- `connect-timeout`
-- `idle-timeout`
-- `max-connections`
+- `negotiation-timeout` — **segundos**. Timeout total de la negociación SOCKS.
+- `connect-timeout` — **segundos**. Timeout de conexión al origen.
+- `idle-timeout` — **segundos**. Timeout de inactividad del túnel.
+- `max-connections` — **cantidad** de conexiones simultáneas (no es una unidad de tiempo).
+
+En los tres timeouts, el valor `0` deshabilita el control. `max-connections=0`
+significa que no se aplica un límite configurable.
 
 El cambio se aplica en memoria y no persiste al reiniciar el proceso:
 

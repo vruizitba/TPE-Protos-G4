@@ -85,9 +85,9 @@ Uso general:
 | Opción | Significado | Valor por defecto |
 |---|---|---|
 | `-h` | Muestra la ayuda y termina. | — |
-| `-l <dirección>` | Dirección numérica del listener SOCKS5. | `0.0.0.0` |
+| `-l <dirección>` | Dirección IP literal del listener SOCKS5 (no nombres de host). | `0.0.0.0` |
 | `-p <puerto>` | Puerto del listener SOCKS5. | `1080` |
-| `-L <dirección>` | Dirección numérica del servicio administrativo. | `127.0.0.1` |
+| `-L <dirección>` | Dirección IP literal del servicio administrativo (no nombres de host). | `127.0.0.1` |
 | `-P <puerto>` | Puerto del servicio administrativo. | `8080` |
 | `-u <usuario>:<clave>` | Usuario SOCKS; repetible hasta 10 veces. | Sin usuarios |
 | `-a <secreto>` | Secreto del servicio administrativo. | Sin configurar |
@@ -196,10 +196,6 @@ kill -TERM <pid>
 - El selector docente usa `select(2)` y `FD_SETSIZE=1024`. Como cada túnel
   consume dos descriptores, el techo práctico observado es de aproximadamente
   510–512 túneles simultáneos, además de los listeners y descriptores internos.
-- Las operaciones de negociación SOCKS y del servicio administrativo manejan
-  escrituras parciales, pero algunos `recv`/`send` previos al relay tratan
-  `EAGAIN`, `EWOULDBLOCK` o `EINTR` como error de sesión. El relay sí contempla
-  expresamente esos resultados.
 - `make stress` usa `pthread_barrier_t`, disponible en la plataforma Linux de
   entrega pero no en macOS. Las pruebas unitarias también presuponen Check y
   Subunit instalados en las rutas del sistema Linux.
